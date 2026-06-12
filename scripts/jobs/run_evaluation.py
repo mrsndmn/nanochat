@@ -121,6 +121,12 @@ if __name__ == "__main__":
     workdir = os.getcwd()
     workdir = workdir.replace('/mnt/virtual_ai0001053-00054_SR004-nfs2/', '/workspace-SR004.nfs2/')
 
+    # Persistent base dir holding checkpoints + eval bundle. Worker containers
+    # resolve ~ to /home/user (no prepared data), so point the job at the
+    # workspace-mounted artifacts/ directory.
+    base_dir_job = f"{workdir}/artifacts"
+    base_dir_local = os.path.join(os.getcwd(), "artifacts")
+
     python_path = sys.executable
     env_prefix = python_path.removesuffix("/python").replace('/home/jovyan/.mlspace/envs/', '/workspace-SR004.nfs2/d.tarasov/envs/')
     _log(f"env_prefix={env_prefix}", output_json)
@@ -137,9 +143,8 @@ if __name__ == "__main__":
     in_progress_jobs = get_in_progress_jobs()
     in_progress_job_descs = {job.get("job_desc", "") for job in in_progress_jobs}
 
-    # Discover checkpoints
-    base_dir = os.environ.get("NANOCHAT_BASE_DIR", os.path.expanduser("~/.cache/nanochat"))
-    base_checkpoints_dir = Path(base_dir) / "base_checkpoints"
+    # Discover checkpoints (in the persistent artifacts base dir)
+    base_checkpoints_dir = Path(base_dir_local) / "base_checkpoints"
     model_tags = _find_model_tags(base_checkpoints_dir, model_filter=args.model_filter)
 
     if not model_tags:
@@ -191,6 +196,7 @@ if __name__ == "__main__":
             "env_variables": {
                 "ENV_PREFIX": env_prefix,
                 "WORKDIR": workdir,
+                "NANOCHAT_BASE_DIR": base_dir_job,
             },
             "instance_type": instance_type,
             "region": extra_options["region"],

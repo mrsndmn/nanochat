@@ -96,10 +96,17 @@ if __name__ == "__main__":
     workdir = os.getcwd()
     workdir = workdir.replace('/mnt/virtual_ai0001053-00054_SR004-nfs2/', '/workspace-SR004.nfs2/')
 
+    # Persistent base dir holding the prepared tokenizer, training data and
+    # checkpoints. Worker containers resolve ~ to /home/user (no prepared data),
+    # so the job must be pointed at the workspace-mounted artifacts/ directory.
+    base_dir_job = f"{workdir}/artifacts"
+    base_dir_local = os.path.join(os.getcwd(), "artifacts")
+
     python_path = sys.executable
     env_prefix = python_path.removesuffix("/python").replace('/home/jovyan/.mlspace/envs/', '/workspace-SR004.nfs2/d.tarasov/envs/')
     print(f"env_prefix={env_prefix}")
     print(f"workdir={workdir}")
+    print(f"base_dir_job={base_dir_job}")
 
     client, extra_options = training_job_api_from_profile(args.profile)
 
@@ -131,9 +138,8 @@ if __name__ == "__main__":
         cmd_hash = experiment_config["cmd_hash"]
         experiment_slug = experiment_config["experiment_slug"]
 
-        # Check if checkpoint already exists (via NANOCHAT_BASE_DIR)
-        base_dir = os.environ.get("NANOCHAT_BASE_DIR", os.path.expanduser("~/.cache/nanochat"))
-        checkpoint_dir = os.path.join(base_dir, "base_checkpoints", model_tag)
+        # Check if checkpoint already exists (in the persistent artifacts base dir)
+        checkpoint_dir = os.path.join(base_dir_local, "base_checkpoints", model_tag)
         if os.path.isdir(checkpoint_dir) and not args.force:
             print(f"\033[33mSkipping: checkpoint already exists at:\033[0m {checkpoint_dir}")
             continue
@@ -158,6 +164,7 @@ if __name__ == "__main__":
             "env_variables": {
                 "ENV_PREFIX": env_prefix,
                 "WORKDIR": workdir,
+                "NANOCHAT_BASE_DIR": base_dir_job,
             },
             "instance_type": instance_type,
             "region": extra_options["region"],
