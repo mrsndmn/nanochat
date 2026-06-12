@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Linear projection embedding: low-rank correction added to wte.
+    # 0 = disabled. When > 0, adds low_dim_embed (vocab × embed_proj_dim) + Linear (embed_proj_dim → n_embd).
+    embed_proj_dim: int = 0
 
 
 def norm(x):
@@ -184,6 +187,14 @@ class GPT(nn.Module):
         self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
+        # Linear projection embedding: low-rank learnable correction summed with wte
+        # inputs_embeds = Linear(low_dim_embed(token_ids)) + wte(token_ids)
+        if config.embed_proj_dim > 0:
+            self.low_dim_embed = nn.Embedding(padded_vocab_size, config.embed_proj_dim)
+            self.embed_proj = Linear(config.embed_proj_dim, config.n_embd, bias=False)
+        else:
+            self.low_dim_embed = None
+            self.embed_proj = None
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -243,6 +254,12 @@ class GPT(nn.Module):
         torch.nn.init.constant_(self.backout_lambda, 0.2)
         torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
+        # Linear projection embedding init
+        if self.low_dim_embed is not None:
+            torch.nn.init.normal_(self.low_dim_embed.weight, mean=0.0, std=0.8)
+            # Zero-init the projection so the correction starts at zero (no change to wte at init)
+            torch.nn.init.zeros_(self.embed_proj.weight)
+
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
@@ -262,6 +279,8 @@ class GPT(nn.Module):
         # because GradScaler cannot unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
+            if self.low_dim_embed is not None:
+                self.low_dim_embed.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
 
@@ -329,7 +348,8 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        low_dim_embed_numel = self.low_dim_embed.weight.numel() if self.low_dim_embed is not None else 0
+        nparams_exclude = (self.transformer.wte.weight.numel() + low_dim_embed_numel + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
@@ -356,14 +376,18 @@ class GPT(nn.Module):
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        low_dim_embed = self.low_dim_embed.weight.numel() if self.low_dim_embed is not None else 0
+        embed_proj = self.embed_proj.weight.numel() if self.embed_proj is not None else 0
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + low_dim_embed + embed_proj + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
+            'low_dim_embed': low_dim_embed,
+            'embed_proj': embed_proj,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
@@ -379,11 +403,13 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
+        low_dim_embed_params = list(self.low_dim_embed.parameters()) if self.low_dim_embed is not None else []
+        embed_proj_params = list(self.embed_proj.parameters()) if self.embed_proj is not None else []
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(low_dim_embed_params) + len(embed_proj_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -394,6 +420,14 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            *(
+                [dict(kind='adamw', params=low_dim_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001)]
+                if low_dim_embed_params else []
+            ),
+            *(
+                [dict(kind='adamw', params=embed_proj_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01)]
+                if embed_proj_params else []
+            ),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
@@ -426,6 +460,9 @@ class GPT(nn.Module):
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
+        # Linear projection: add low-rank correction from projected low-dim embedding
+        if self.low_dim_embed is not None:
+            x = x + self.embed_proj(self.low_dim_embed(idx))
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
