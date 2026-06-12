@@ -47,7 +47,13 @@ echo "ARGS: $@"
 set +x
 set +e
 
-exec ${ENV_PREFIX}/torchrun \
+# Invoke torchrun via the env's python instead of the `torchrun` console-script.
+# The console-script has a hard-coded shebang pointing at the path where the env
+# was originally created (e.g. /home/jovyan/.mlspace/envs/...), which does not
+# exist on worker nodes that mount the env under a different path (/workspace-...).
+# Running `python -m torch.distributed.run` uses the real interpreter at ENV_PREFIX
+# and avoids the stale shebang entirely.
+exec ${ENV_PREFIX}/python -m torch.distributed.run \
     --nproc_per_node=$NUM_GPUS \
     --nnodes=$WORLD_SIZE \
     --node_rank=$RANK \
