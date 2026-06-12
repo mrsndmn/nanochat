@@ -21,7 +21,6 @@ import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
 
-import wandb
 import torch
 import torch.distributed as dist
 
@@ -40,7 +39,8 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="dummy", help="run name ('dummy' disables logging)")
+parser.add_argument("--logger", type=str, default="tb", choices=["tb", "wandb", "dummy"], help="logging backend: tb (TensorBoard), wandb, or dummy")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -96,9 +96,22 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+# Logging init (TensorBoard by default, wandb optional)
+from pathlib import Path
+from nanochat.job_progress import JobProgress
+if args.run == "dummy" or not master_process:
+    run_logger = DummyWandb()
+elif args.logger == "wandb":
+    import wandb
+    run_logger = wandb.init(project="nanochat", name=args.run, config=user_config)
+elif args.logger == "tb":
+    from nanochat.tb_logger import TBLogger
+    tb_log_dir = os.path.join(get_base_dir(), "tb_logs", "nanochat", args.run)
+    run_logger = TBLogger(log_dir=tb_log_dir, config=user_config)
+    print0(f"TensorBoard logs: {tb_log_dir}")
+else:
+    run_logger = DummyWandb()
+job_progress = JobProgress(output_file=Path(os.path.join(get_base_dir(), "job_progress", f"{args.run}.json"))) if master_process else None
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -415,6 +428,8 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
+if job_progress is not None:
+    job_progress.on_train_begin(max_steps=num_iterations)
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -429,7 +444,7 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        run_logger.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -446,7 +461,7 @@ while True:
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
+        run_logger.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
@@ -579,7 +594,9 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        wandb_run.log(log_data)
+        run_logger.log(log_data)
+        if job_progress is not None:
+            job_progress.on_log(step=step, metrics={"train/loss": debiased_smooth_loss, "train/mfu": mfu})
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
@@ -594,6 +611,10 @@ while True:
         gc.disable() # nuclear intervention here: disable GC entirely except:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
+
+# Finalize job progress
+if job_progress is not None:
+    job_progress.on_train_end()
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
@@ -628,5 +649,5 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
-wandb_run.finish() # wandb run finish
+run_logger.finish() # wandb run finish
 compute_cleanup()

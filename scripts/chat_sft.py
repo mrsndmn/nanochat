@@ -14,7 +14,6 @@ import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
-import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
@@ -36,7 +35,8 @@ from tasks.spellingbee import SimpleSpelling, SpellingBee
 # CLI arguments
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="dummy", help="run name ('dummy' disables logging)")
+parser.add_argument("--logger", type=str, default="tb", choices=["tb", "wandb", "dummy"], help="logging backend: tb (TensorBoard), wandb, or dummy")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
@@ -84,9 +84,22 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+# Logging init (TensorBoard by default, wandb optional)
+from pathlib import Path
+from nanochat.job_progress import JobProgress
+if args.run == "dummy" or not master_process:
+    run_logger = DummyWandb()
+elif args.logger == "wandb":
+    import wandb
+    run_logger = wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+elif args.logger == "tb":
+    from nanochat.tb_logger import TBLogger
+    tb_log_dir = os.path.join(get_base_dir(), "tb_logs", "nanochat-sft", args.run)
+    run_logger = TBLogger(log_dir=tb_log_dir, config=user_config)
+    print0(f"TensorBoard logs: {tb_log_dir}")
+else:
+    run_logger = DummyWandb()
+job_progress = JobProgress(output_file=Path(os.path.join(get_base_dir(), "job_progress", f"sft-{args.run}.json"))) if master_process else None
 
 # Flash Attention status
 if not HAS_FA3:
@@ -334,6 +347,8 @@ smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
+if job_progress is not None:
+    job_progress.on_train_begin(max_steps=args.num_iterations if args.num_iterations > 0 else 0)
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -352,7 +367,7 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        run_logger.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -386,7 +401,7 @@ while True:
         chatcore = centered_mean(all_tasks)
         chatcore_cat = centered_mean(categorical_tasks)
         print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f} | ChatCORE_cat: {chatcore_cat:.4f}")
-        wandb_run.log({
+        run_logger.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "chatcore_metric": chatcore,
@@ -475,7 +490,7 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
-        wandb_run.log({
+        run_logger.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -486,6 +501,8 @@ while True:
             "train/mfu": mfu,
             "train/epoch": current_epoch,
         })
+        if job_progress is not None:
+            job_progress.on_log(step=step, metrics={"train/loss": debiased_smooth_loss, "train/mfu": mfu})
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
     # We manually manage it to avoid these pauses during training.
@@ -495,6 +512,10 @@ while True:
         gc.disable() # disable GC entirely except:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very long runs
+
+# Finalize job progress
+if job_progress is not None:
+    job_progress.on_train_end()
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
@@ -515,5 +536,5 @@ get_report().log(section="SFT", data=[
 ])
 
 # cleanup
-wandb_run.finish() # wandb run finish
+run_logger.finish() # wandb run finish
 compute_cleanup()
