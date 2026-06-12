@@ -1,0 +1,21 @@
+# Arkhip per-project config (schema: research_loop.domain.project_config.ProjectPromptConfig)
+#
+# Parameterizes the research-loop stage prompts and the testing stage.
+# Created to initialize the nanochat project for the Arkhip research loop.
+
+# Python package under active experimentation (source of truth for model/training code).
+source_dir: nanochat
+
+# Training launcher: defines experiment_configs, supports --dry, and prints the
+# __TRAINING_JOBS_JSON__ marker after launching MLSpace jobs.
+training_script: scripts/jobs/run_training.py
+
+# Evaluation launcher: discovers trained checkpoints and submits base_eval jobs.
+# Supports --dry and --output json (JSON-only stdout for machine parsing).
+eval_script: scripts/jobs/run_evaluation.py
+
+# Results aggregation script (consumed by the results stage as scripts/results.py).
+results_script: scripts/results.py
+
+# Deterministic test command run by the testing stage (executed via `bash -c`).
+test_cmd: python -m pytest tests/ -v
