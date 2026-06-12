@@ -131,7 +131,7 @@ if __name__ == "__main__":
     author_name = args.author_name
     telegram_nick = args.telegram_nick
     experiment_slug = "nanochat_eval"
-    num_gpus = 8
+    num_gpus = 4
     instance_type = f"a100.{num_gpus}gpu"
 
     in_progress_jobs = get_in_progress_jobs()

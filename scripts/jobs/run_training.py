@@ -27,8 +27,8 @@ def linear_projection_embedding_experiments() -> list[dict]:
     """Linear projection embedding ablation: vary embed_proj_dim with d12 baseline."""
     experiment_group = "linear-projection-embeddings"
     experiment_slug = "linear_proj_emb"
-    num_gpus = 8
-    instance_type = "a100.8gpu"
+    num_gpus = 4
+    instance_type = "a100.4gpu"
     depth = 12
 
     # Shared training args
