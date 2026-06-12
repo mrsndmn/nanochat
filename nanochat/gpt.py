@@ -209,6 +209,13 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
+    @property
+    def max_seq_len(self):
+        # Hard limit on the sequence length the model can forward: the rotary cache size.
+        # Exposed so evaluation code (e.g. core_eval) can truncate over-long sequences
+        # (such as long few-shot CORE prompts) instead of tripping the rotary assert in forward().
+        return self.cos.size(1)
+
     @torch.no_grad()
     def init_weights(self):
         """
