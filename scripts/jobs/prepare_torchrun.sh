@@ -32,6 +32,13 @@ MASTER_HOST=$(perl -E "my \$x = '$PMIX_HOSTNAME'; \$x =~ s/-\w+-\d+$/-mpimaster-
 MASTER_HOST_FULL="$MASTER_HOST.$MASTER_HOST_PREFIX"
 echo "MASTER_HOST_FULL $MASTER_HOST_FULL"
 
+# Job name (lm-mpi-job-<UUID>) for Arkhip's /status progress file. MASTER_HOST_PREFIX
+# already strips the -mpimaster-N / -worker-N suffix off the MPI hostname, leaving the
+# bare job name Arkhip keys on. Exported so JobProgress writes <job_name>.json into the
+# metrics dir; absent (e.g. local runs) -> no progress file is written.
+export ARKHIP_JOB_NAME=$MASTER_HOST_PREFIX
+echo "ARKHIP_JOB_NAME=$ARKHIP_JOB_NAME"
+
 # Set DDP environment variables
 export MASTER_ADDR=$MASTER_HOST_FULL
 export MASTER_PORT=12345

@@ -19,6 +19,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Env var carrying the MLSpace job name (lm-mpi-job-<UUID>), exported by
+# scripts/jobs/prepare_torchrun.sh from the MPI hostname. Arkhip's /status reads
+# the progress file at <RL_RUN_JOBS_METRICS_DIR>/<job_name>.json, so the file must
+# be named after the job. Default metrics dir mirrors Arkhip's domain.config default.
+JOB_NAME_ENV = "ARKHIP_JOB_NAME"
+METRICS_DIR_ENV = "RL_RUN_JOBS_METRICS_DIR"
+DEFAULT_METRICS_DIR = "/workspace-SR004.nfs2/arkhip/run-jobs"
+
+
+def build_job_progress() -> "JobProgress | None":
+    """Build a JobProgress that writes where Arkhip's /status expects it.
+
+    Arkhip reads <RL_RUN_JOBS_METRICS_DIR>/<job_name>.json, so the file is named
+    after the bare MLSpace job name. Returns None when the job-name env var (set
+    only inside MLSpace jobs) is absent — local/dummy runs create no progress file.
+    """
+    job_name = os.environ.get(JOB_NAME_ENV, "").strip()
+    if not job_name:
+        return None
+    metrics_dir = os.environ.get(METRICS_DIR_ENV, "").strip() or DEFAULT_METRICS_DIR
+    output_file = Path(metrics_dir) / f"{job_name}.json"
+    return JobProgress(output_file=output_file)
+
 
 def _format_duration(seconds: float | None) -> str | None:
     if seconds is None:

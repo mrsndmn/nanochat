@@ -86,7 +86,7 @@ else:
 
 # Logging init (TensorBoard by default, wandb optional)
 from pathlib import Path
-from nanochat.job_progress import JobProgress
+from nanochat.job_progress import build_job_progress
 if args.run == "dummy" or not master_process:
     run_logger = DummyWandb()
 elif args.logger == "wandb":
@@ -99,7 +99,7 @@ elif args.logger == "tb":
     print0(f"TensorBoard logs: {tb_log_dir}")
 else:
     run_logger = DummyWandb()
-job_progress = JobProgress(output_file=Path(os.path.join(get_base_dir(), "job_progress", f"sft-{args.run}.json"))) if master_process else None
+job_progress = build_job_progress() if master_process else None
 
 # Flash Attention status
 if not HAS_FA3:
