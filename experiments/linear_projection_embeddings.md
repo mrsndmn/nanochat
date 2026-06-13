@@ -11,6 +11,37 @@ learns a correction in a low-dimensional bottleneck space.
 ## Setup
 
 Training function: `scripts/base_train.py` with `--embed-proj-dim` flag.
+Configs in `scripts/jobs/run_training.py` (`linear_projection_embedding_experiments`);
+evaluation via `scripts/jobs/run_evaluation.py` → `scripts/base_eval.py`. Code is the
+single source of truth for all hyperparameters, model selection, and job configs.
+
+### Investigation (reviewer-mandated): why is CORE insensitive across projection variants?
+
+**Open question.** Across all six d12 input-embedding projection variants the CORE metric
+comes out (nearly) identical (0.0603) even though val_bpb clearly separates them
+(e.g. −0.0588 val_bpb at `embed_proj_dim=512`). Before launching the
+[[low_rank_unembedding]] follow-up, the reviewer requires us to understand *why* CORE does
+not move, so that we are not building on a metric that cannot discriminate these runs.
+
+**Goal (a) — root-cause the CORE insensitivity.** Determine which of the following explains
+the flat CORE, and rule the others in or out with evidence:
+- *Genuine metric saturation / low resolution* — CORE is simply too coarse to resolve quality
+  differences for a small (d12) model at this training budget, so equal scores reflect real
+  (lack of) separation rather than a defect.
+- *Too few eval examples* — the number of CORE examples per task (e.g. `--max-per-task`
+  subsampling) is small enough that score quantization hides true differences; more examples
+  would separate the variants.
+- *A bug / pipeline artifact*, e.g. evaluation not actually loading the projection weights,
+  reading a shared or wrong checkpoint (note: `base_eval` resolves checkpoints purely by
+  `model_tag`/`step`, so if variants collide on a single tag they would all evaluate the same
+  weights), or a hardcoded model path — any of which would make every variant evaluate an
+  identical model and produce identical CORE by construction.
+
+**Goal (b) — propose a path to reliable, discriminative results.** Recommend concrete ways to
+obtain CORE (or an alternative downstream metric) that actually separates these low-dim
+projection experiments — e.g. confirming per-variant checkpoints are distinct and loaded,
+increasing the eval example count, evaluating at a larger depth / longer training budget where
+CORE becomes discriminating, or adding a finer-grained complementary metric alongside val_bpb.
 
 ## Results
 
@@ -59,3 +90,8 @@ gain carries to downstream quality.
 
 - 2026-06-12: Initial implementation of linear projection embeddings in gpt.py and base_train.py
 - 2026-06-13: Filled Results/Conclusions from step-2520 eval; proj_512 best on BPB, CORE saturated.
+- 2026-06-13: Per reviewer feedback, pivoted to a CORE-reliability investigation — added an
+  Investigation sub-section under Setup framing the open question (flat CORE despite separating
+  val_bpb) with goals (a) root-cause the insensitivity (metric saturation vs. too few eval
+  examples vs. an eval/checkpoint-loading bug) and (b) propose how to get discriminative results.
+  The [[low_rank_unembedding]] training launch is deferred until this is resolved.
