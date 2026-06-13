@@ -252,30 +252,71 @@ single source of truth; the above states intent, not values.
 
 ### Results
 
-_(pending — multi-seed runs not yet completed)_
+Five training seeds (s0–s4) per variant at step 2520, each evaluated with ≥5 eval seeds.
+`CORE` below is the mean over eval seeds for that training seed; the `±` after the per-variant
+means is the **training-seed** std (the run-to-run noise the decision rule is measured against).
+
+| variant  | embed_proj_dim | val_bpb (mean ± std) | val_bpb range   | CORE (mean ± std) | CORE range      |
+|----------|----------------|----------------------|-----------------|-------------------|-----------------|
+| baseline | 0              | 1.7889 ± 0.0025      | 1.7861–1.7925   | 0.0541 ± 0.0076   | 0.0448–0.0658   |
+| proj_512 | 512            | **1.7349 ± 0.0058**  | 1.7295–1.7432   | 0.0630 ± 0.0093   | 0.0464–0.0684   |
+
+**val_bpb (PRIMARY) — proj_512 advantage holds far beyond 2σ → ADOPT.**
+- Mean advantage = **0.0540 bpb** (≈ 3.0% relative), i.e. **9.4σ** of proj_512's own training-seed
+  std and **21.6σ** of baseline's (Welch t ≈ 19.2). This clears the 2σ adoption threshold by an
+  order of magnitude.
+- The two seed distributions are **completely non-overlapping**: the *worst* proj_512 seed
+  (1.7432) still beats the *best* baseline seed (1.7861) by 0.0429 bpb. The single-run −0.0588
+  gain was therefore not a lucky seed — it reproduces (slightly smaller, 0.0540) across every
+  seed pairing.
+
+**CORE (CONFIRMATORY) — cannot resolve the deltas → DROP as a d12 selection metric.**
+- Per-variant CORE difference is only 0.0090 (proj 0.0630 vs base 0.0541), **Welch t ≈ 1.67,
+  i.e. < 2σ** — not significant.
+- The dominant noise is **training-seed** variance: std ≈ 0.0076 (baseline) / 0.0093 (proj_512),
+  both **larger than the ~0.005 delta** the metric would need to resolve and larger than the
+  0.0090 between-variant gap itself. The tight per-row eval-seed std (`CORE_std` 0.0004–0.0030)
+  is misleading precision — it bounds few-shot sampling noise only, while run-to-run variance is
+  ~3–4× larger and makes the variant CORE ranges overlap heavily (proj 0.0464–0.0684 vs base
+  0.0448–0.0658).
+- Concretely, proj_512 seed s4 collapses to CORE 0.0464 — squarely inside the baseline range —
+  even though the *same* checkpoint still wins on val_bpb (1.7432, below every baseline). CORE
+  and val_bpb disagree at the seed level, the noise-signature predicted earlier. Even at ≥5 eval
+  seeds CORE does not separate the variants, so it is dropped as a d12 selection metric.
+
+#### Anomalies
+- `proj_512_s4` is the weakest proj_512 seed on *both* metrics (val_bpb 1.7432, CORE 0.0464); it
+  still beats all baselines on val_bpb but drives most of proj_512's CORE std. No checkpoint is
+  missing; the legacy single-run tags (`*_2b0bc792`, `*_9077cd29`, etc.) remain only for
+  cross-reference and agree with the seeded means.
 
 ## Conclusions
 
-The zero-initialized low-rank embedding correction **helps**, consistently lowering val_bpb
-over the baseline, with **`embed_proj_dim=512` best** (1.7289, −0.0588 bpb vs 1.7877) at a
-modest ~17M added parameters. Returns diminish past 512 — larger bottlenecks add parameters
-without improving (or slightly hurting) BPB.
+**Adopt `embed_proj_dim=512` as the d12 default.** Across 5 training seeds the zero-initialized
+low-rank embedding correction lowers val_bpb by **0.0540 ± (proj std 0.0058)** — from
+1.7889 ± 0.0025 (baseline) to **1.7349 ± 0.0058** (proj_512). That advantage is **9.4σ** of the
+run-to-run (training-seed) variance — far past the 2σ adoption rule — with the two seed
+distributions **completely non-overlapping** (worst proj_512 seed beats best baseline seed by
+0.0429 bpb). The earlier single-run −0.0588 gain was real, not a lucky seed.
 
-The flat CORE (0.0603) was a **pure reporting artifact** (step-keyed CSV overwrite), now fixed:
-CORE is per-variant distinct. But the corrected CORE is **not yet reliable** — single eval
-seed, no variance, and an ordering that contradicts val_bpb and `embed_proj_dim`. So **val_bpb
-remains the only trustworthy discriminator**, and on val_bpb proj_512 is the clear winner; the
-low-dim projection helps. Whether it helps *CORE* is currently unanswerable.
+**Drop CORE as a d12 selection metric.** Even with ≥5 eval seeds, CORE cannot resolve these
+variants: the proj_512−baseline difference is only 0.0090 (Welch t ≈ 1.67, < 2σ), and the
+**training-seed** std (0.0076–0.0093) exceeds both the ~0.005 delta of interest and the
+between-variant gap itself. Tight per-row eval-seed `CORE_std` (0.0004–0.0030) is misleading
+precision — it bounds few-shot sampling only, not run-to-run variance. CORE even disagrees with
+val_bpb at the seed level (proj_512 s4: best-tier val_bpb but baseline-tier CORE). This confirms
+the earlier noise-signature observation. **val_bpb is the trustworthy primary metric at d12;**
+CORE should not gate d12 model selection.
 
 **Recommended next steps (in priority order):**
-1. **Re-eval with ≥5 eval seeds** (cheap — no retraining) to put a std/SE on CORE and decide
-   whether the ~0.012 variant spread survives few-shot sampling noise.
-2. **Retrain the key comparison (baseline vs. proj_512) with ≥3 training seeds** (5 preferred)
-   and report val_bpb and CORE as mean ± std — this is the only way to show the proj_512 gain
-   exceeds run-to-run variance rather than being a lucky seed.
-3. **Keep val_bpb as the primary metric** and adopt `embed_proj_dim=512` as the default; if
-   CORE still fails to resolve ~0.005 deltas even with 5 seeds, confirm the bpb gain at greater
-   depth / longer budget where CORE separates, rather than chasing CORE at d12.
+1. **Promote `embed_proj_dim=512` to the d12 default** in the training config and use it as the
+   baseline for subsequent d12 work.
+2. **Test the projection at greater depth** (e.g. d20/d26) to see whether the val_bpb gain
+   persists and scales — and whether CORE *does* separate variants once the model is large
+   enough that argmin decisions flip; CORE only becomes a candidate selection metric there.
+3. **Stop chasing CORE at d12.** Do not spend further eval-seed budget trying to resolve d12
+   CORE deltas; rely on val_bpb. Resume the deferred [[low_rank_unembedding]] follow-up on the
+   same val_bpb-primary footing.
 
 ## Changelog
 
@@ -310,3 +351,11 @@ low-dim projection helps. Whether it helps *CORE* is currently unanswerable.
   `embed_proj_dim=512` as the d12 default only if its val_bpb advantage exceeds 2σ of
   training-seed variance; drop CORE as a d12 selection metric if it cannot resolve ~0.005 deltas
   at 5 eval seeds. val_bpb is primary, CORE confirmatory. Single-run findings left intact above.
+- 2026-06-13: **Multi-seed results in — decision reached.** 5 training seeds × ≥5 eval seeds.
+  val_bpb: baseline 1.7889 ± 0.0025 vs proj_512 1.7349 ± 0.0058; advantage 0.0540 bpb = **9.4σ**
+  of training-seed variance (Welch t ≈ 19.2), seed distributions completely non-overlapping →
+  **adopt `embed_proj_dim=512` as the d12 default.** CORE: baseline 0.0541 ± 0.0076 vs proj_512
+  0.0630 ± 0.0093, difference 0.0090 (Welch t ≈ 1.67, < 2σ); training-seed std exceeds the
+  ~0.005 delta and CORE disagrees with val_bpb at the seed level (proj_512 s4) → **drop CORE as
+  a d12 selection metric**, confirming the noise-signature observation. Filled the multi-seed
+  Results and rewrote Conclusions. Next: promote 512 to default, test at greater depth.
