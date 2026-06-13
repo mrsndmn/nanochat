@@ -48,31 +48,40 @@ CORE becomes discriminating, or adding a finer-grained complementary metric alon
 d12 models, step 2520. Config lives in `scripts/jobs/run_training.py`
 (`linear_projection_embedding_experiments`).
 
-| variant       | embed_proj_dim | val_bpb    | Δbpb vs base | CORE   |
-|---------------|----------------|------------|--------------|--------|
-| baseline      | 0              | 1.7877     | —            | 0.0603 |
-| proj_128      | 128            | 1.7599     | −0.0278      | 0.0603 |
-| proj_256      | 256            | 1.7401     | −0.0476      | 0.0603 |
-| **proj_512**  | **512**        | **1.7289** | **−0.0588**  | 0.0603 |
-| proj_1024     | 1024           | 1.7384     | −0.0493      | 0.0603 |
-| proj_2048     | 2048           | 1.7315     | −0.0562      | 0.0603 |
+Re-evaluated after the reporting fix (commit `47543b6`). CORE is now read per-`(model_tag,
+step)` from the canonical `evaluation/eval_<step>.json`, so it is **no longer byte-identical**
+across variants. **Single eval seed (1337)** per variant, so no cross-seed std yet
+(`core_metric_std = 0.0` is degenerate, not a real uncertainty).
 
-- **BPB:** every projection variant beats the no-projection baseline. The gain grows with
-  `embed_proj_dim` up to 512 (best, −0.0588 bpb / −3.3% relative) and then plateaus /
-  slightly regresses — 1024 and 2048 are both worse than 512.
-- **CORE:** identical (0.0603) across all six d12 variants; CORE does not separate them at
-  this scale/step (see anomaly).
+| variant       | embed_proj_dim | val_bpb    | Δbpb vs base | CORE (1 seed) |
+|---------------|----------------|------------|--------------|---------------|
+| baseline      | 0              | 1.7877     | —            | 0.0616        |
+| proj_128      | 128            | 1.7599     | −0.0278      | 0.0536        |
+| proj_256      | 256            | 1.7401     | −0.0476      | 0.0618        |
+| **proj_512**  | **512**        | **1.7289** | **−0.0588**  | 0.0588        |
+| proj_1024     | 1024           | 1.7384     | −0.0493      | **0.0657**    |
+| proj_2048     | 2048           | 1.7315     | −0.0562      | 0.0586        |
+
+- **BPB (primary, discriminative):** every projection variant beats the no-projection
+  baseline. The gain grows with `embed_proj_dim` up to 512 (best, −0.0588 bpb / −3.3%
+  relative) and then plateaus / slightly regresses — 1024 and 2048 are both worse than 512.
+- **CORE (now distinct, but not yet reliable):** spread 0.0536–0.0657 across the six variants.
+  Crucially the CORE ordering is **uncorrelated with val_bpb**: the best-bpb variant (proj_512)
+  sits *below* baseline on CORE, proj_128 (a clear bpb win) is *worst* on CORE, and proj_1024
+  tops CORE. With only one eval seed and no run-to-run estimate, this ~0.012 spread is
+  consistent with sampling/run noise rather than a real quality ranking.
 - **Parameter cost:** added params = `embed_proj_dim × (vocab 32768 + n_embd 768)` =
   `embed_proj_dim × 33536`. So 512 adds ~17M params; 2048 adds ~69M for a *worse* BPB than
   512. 512 is the clear efficiency sweet spot.
 
 ### Anomalies
 
-- All six d12 variants report the **same CORE (0.0603)** despite distinct BPB — the metric
-  is saturated/insensitive at this training budget; treat it as non-discriminating here,
-  not as evidence of equivalence.
+- **CORE/val_bpb discordance.** CORE no longer separates variants in a way that tracks val_bpb
+  (or even monotonically with `embed_proj_dim`); treat the per-variant CORE deltas as noise
+  until multi-seed uncertainty is measured.
 - `d12` (step 250) and `d6` (step 1000) are partially-trained reference runs with negative
-  CORE; not part of this ablation.
+  CORE; not part of this ablation. `d12_unembed_512` belongs to [[low_rank_unembedding]]
+  (val_bpb 1.8686, worse than baseline) and is listed only for cross-reference.
 
 ## CORE-reliability investigation
 
@@ -178,19 +187,50 @@ All concrete values (seed count, example budget, depth) live in
 
 ### Results
 
-_(empty — to be filled after the reporting fix and multi-seed re-eval.)_
+**Q1 — artifact vs. real flatness: confirmed pure reporting artifact, now resolved.** After
+the fix (`base_eval.py` writes the canonical per-checkpoint `evaluation/eval_<step>.json` keyed
+by `(model_tag, step)`; `results.py` reads it per-tag), CORE comes out **distinct** for every
+variant (0.0536 / 0.0618 / 0.0588 / 0.0657 / 0.0586 vs. baseline 0.0616) instead of the old
+byte-identical 0.0603. The underlying checkpoints always differed — val_bpb separated them all
+along — so there is **no residual model-behavior flatness**; the 0.0603 was entirely the
+step-only CSV overwrite predicted by hypothesis (e).
+
+**Q2 — reliability: not yet established.** The re-eval used a **single eval seed (1337)**, so
+`core_metric_std = 0.0` is a single-sample placeholder, not a measured uncertainty, and the
+`CORE_std` column is empty. Two independent caveats prevent calling the per-variant CORE deltas
+real:
+- *No variance estimate.* The CORE spread (0.0536–0.0657, ~20% relative) has no error bars.
+- *Wrong-direction ordering.* CORE does not track val_bpb or `embed_proj_dim`, which is exactly
+  what coarse, decision-based (argmin) noise looks like at d12 (investigation cause (b)).
+
+Note the two noise sources are distinct: `--seeds` only varies `fewshot_seed = 1234 + seed` and
+the subsample shuffle (`base_eval.py:150,160`), i.e. CORE's few-shot sampling — it does **not**
+change val_bpb (deterministic per checkpoint) and does **not** capture training-run
+stochasticity. Establishing reliability therefore needs *both* (i) multiple **eval** seeds to
+bound few-shot sampling noise and (ii) multiple **training** seeds to bound run-to-run variance.
 
 ## Conclusions
 
 The zero-initialized low-rank embedding correction **helps**, consistently lowering val_bpb
 over the baseline, with **`embed_proj_dim=512` best** (1.7289, −0.0588 bpb vs 1.7877) at a
 modest ~17M added parameters. Returns diminish past 512 — larger bottlenecks add parameters
-without improving (or slightly hurting) BPB. CORE is too coarse to confirm the benefit at
-this scale.
+without improving (or slightly hurting) BPB.
 
-**Recommended next step:** adopt `embed_proj_dim=512` as default and re-evaluate on a
-longer/larger run (or greater depth) where CORE becomes discriminating, to confirm the BPB
-gain carries to downstream quality.
+The flat CORE (0.0603) was a **pure reporting artifact** (step-keyed CSV overwrite), now fixed:
+CORE is per-variant distinct. But the corrected CORE is **not yet reliable** — single eval
+seed, no variance, and an ordering that contradicts val_bpb and `embed_proj_dim`. So **val_bpb
+remains the only trustworthy discriminator**, and on val_bpb proj_512 is the clear winner; the
+low-dim projection helps. Whether it helps *CORE* is currently unanswerable.
+
+**Recommended next steps (in priority order):**
+1. **Re-eval with ≥5 eval seeds** (cheap — no retraining) to put a std/SE on CORE and decide
+   whether the ~0.012 variant spread survives few-shot sampling noise.
+2. **Retrain the key comparison (baseline vs. proj_512) with ≥3 training seeds** (5 preferred)
+   and report val_bpb and CORE as mean ± std — this is the only way to show the proj_512 gain
+   exceeds run-to-run variance rather than being a lucky seed.
+3. **Keep val_bpb as the primary metric** and adopt `embed_proj_dim=512` as the default; if
+   CORE still fails to resolve ~0.005 deltas even with 5 seeds, confirm the bpb gain at greater
+   depth / longer budget where CORE separates, rather than chasing CORE at d12.
 
 ## Changelog
 
@@ -212,3 +252,10 @@ gain carries to downstream quality.
   CORE-reliability investigation section with hypothesis, evidence, and a proposal (val_bpb as
   primary; key CORE output by model_tag + write canonical JSON; distinct-checkpoint sanity
   check; multi-seed mean±std; larger CORE budget; report Δ with uncertainty).
+- 2026-06-13: Re-evaluated all six d12 variants after the reporting fix (`47543b6`). Confirmed
+  the flat 0.0603 was a **pure reporting artifact** — CORE is now per-variant distinct
+  (0.0536–0.0657 vs baseline 0.0616), no residual model flatness. But reliability is **not yet
+  established**: only one eval seed (1337, `core_metric_std=0.0`), and CORE ordering is
+  uncorrelated with val_bpb / `embed_proj_dim` → deltas consistent with noise. Filled the
+  investigation Results; val_bpb stays primary (proj_512 best). Next: ≥5 eval seeds for CORE
+  variance, ≥3 training seeds for baseline-vs-proj_512 run-to-run, report mean±std.
