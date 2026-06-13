@@ -51,6 +51,7 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+parser.add_argument("--num-train-shards", type=int, default=-1, help="cap on number of train shards used (-1 = all available). Pins the epoch/data budget so a run can be kept within a single epoch (no data repetition); val split always uses the last shard")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--embed-proj-dim", type=int, default=0, help="low-rank embedding projection dim (0=disabled). Adds low_dim_embed + Linear projection summed with wte")
 parser.add_argument("--unembed-proj-dim", type=int, default=0, help="low-rank unembedding correction dim (0=disabled). Adds a LoRA-style low-rank term to lm_head logits")
@@ -365,7 +366,7 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, num_train_shards=args.num_train_shards)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 

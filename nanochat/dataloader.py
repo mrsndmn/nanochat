@@ -22,13 +22,19 @@ import pyarrow.parquet as pq
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, num_train_shards=-1):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
     Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
+
+    num_train_shards caps how many train shards are used (-1 = all available). This pins the
+    data budget / epoch size for the train split so an experiment can guarantee it stays within
+    a single epoch over a fixed amount of data (the val split always uses the last shard and is
+    unaffected). The loop is still infinite (multi-epoch); the cap only sets *how much* data one
+    epoch covers.
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
@@ -36,6 +42,12 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+    if split == "train" and num_train_shards > 0:
+        assert num_train_shards <= len(parquet_paths), (
+            f"Requested num_train_shards={num_train_shards} but only {len(parquet_paths)} "
+            f"train shards are available; download more shards (nanochat.dataset)."
+        )
+        parquet_paths = parquet_paths[:num_train_shards]
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
@@ -75,7 +87,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, num_train_shards=-1
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -96,7 +108,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, num_train_shards=num_train_shards)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1

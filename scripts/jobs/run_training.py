@@ -112,11 +112,35 @@ def linear_projection_embeddings_10k_experiments() -> list[dict]:
     # Single seed only — no multi-seed fan-out this phase (see docstring).
     seed = 0
 
-    # Longer training horizon: 10k explicit optimization steps.
+    # ------------------------------------------------------------------
+    # Data budget: keep 10k steps within AT MOST one epoch (no wrap / no
+    # data repetition) over the now-expanded ClimbMix shards.
+    #
+    # The global (effective) batch size is UNCHANGED from the prior 10k run:
+    #   device_batch_size(32) * grad_accum(2) * num_gpus(4) * seq_len(2048)
+    #     = total_batch_size 524,288 tokens/step  (auto-computed at d12, verified
+    #       from the prior checkpoint meta). We deliberately do NOT pass
+    #       --device-batch-size / --max-seq-len / --total-batch-size so all of
+    #       these stay exactly as before.
+    #
+    # Tokens trained over the run:
+    #   524,288 tokens/step * 10,000 steps = 5.243e9 trained tokens.
+    # Measured trained tokens per shard (bestfit packer, ~17% crop at T=2048):
+    #   ~44.7e6 tokens/shard.
+    # Shards needed for >= 1 epoch:
+    #   ceil(5.243e9 / 44.7e6) = 118 shards.
+    # We pin all 150 available train shards (~6.7e9 trained tokens/epoch), so
+    # 10k steps consume ~0.78 epoch and the loader never wraps within the run
+    # (the prior run looped a tiny shard set 58x — pure memorization).
+    # ------------------------------------------------------------------
+    num_train_shards = 150  # >= 118 required; provides ~0.78-epoch headroom
+
+    # Longer training horizon: 10k explicit optimization steps, capped to <=1 epoch of data.
     shared_args = [
         f"--depth {depth}",
         "--window-pattern SSSL",
         "--num-iterations 10000",
+        f"--num-train-shards {num_train_shards}",
     ]
 
     # Two arms; the tag encodes proj dim explicitly (baseline = no projection).

@@ -86,3 +86,48 @@ def test_required_keys_and_node_settings():
         assert REQUIRED_KEYS.issubset(c.keys())
         assert c["instance_type"] == "a100.4gpu"
         assert c["num_gpus"] == 4
+
+
+# --- data budget: <= 1 epoch over the expanded shards ------------------------
+
+# Global batch is 524,288 tokens/step (device_batch 32 * grad_accum 2 * gpus 4 * seq 2048),
+# so 10k steps train 5.243e9 tokens. With ~44.7e6 trained tokens/shard that needs >=118 shards
+# for a single epoch with no wrap-around.
+TOKENS_PER_STEP = 32 * 2 * 4 * 2048
+MIN_SHARDS_FOR_ONE_EPOCH = 118
+
+
+def test_num_train_shards_pinned_and_sufficient():
+    configs = linear_projection_embeddings_10k_experiments()
+    for c in configs:
+        m = re.search(r"--num-train-shards (\d+)", c["args"])
+        assert m, f"no --num-train-shards in args: {c['args']}"
+        n = int(m.group(1))
+        # Must provide at least one full epoch of data so the loader never wraps in 10k steps.
+        assert n >= MIN_SHARDS_FOR_ONE_EPOCH, (
+            f"{n} shards < {MIN_SHARDS_FOR_ONE_EPOCH} needed for 1 epoch over 10k steps"
+        )
+
+
+def test_one_epoch_budget_holds():
+    # The pinned shard count must cover the full 10k-step token budget at <=1 epoch.
+    configs = linear_projection_embeddings_10k_experiments()
+    trained_tokens_per_shard = 44.7e6  # measured (bestfit, ~17% crop at T=2048)
+    total_trained_tokens = TOKENS_PER_STEP * 10000
+    for c in configs:
+        n = int(re.search(r"--num-train-shards (\d+)", c["args"]).group(1))
+        epoch_tokens = n * trained_tokens_per_shard
+        assert total_trained_tokens <= epoch_tokens, (
+            f"10k steps train {total_trained_tokens:.3e} tokens > {epoch_tokens:.3e} "
+            f"available in {n} shards (would wrap past 1 epoch)"
+        )
+
+
+def test_global_batch_size_unchanged():
+    # The data-budget change must NOT touch the global/effective batch size: per-device batch,
+    # grad-accum, seq-len and total-batch-size are all left at their previous (default) values.
+    configs = linear_projection_embeddings_10k_experiments()
+    for c in configs:
+        assert "--device-batch-size" not in c["args"]
+        assert "--max-seq-len" not in c["args"]
+        assert "--total-batch-size" not in c["args"]
