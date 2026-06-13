@@ -18,12 +18,35 @@ consistent with noise rather than a real quality ranking, so CORE cannot yet be 
 discriminate these variants. This phase asks: **does the proj_512 val_bpb advantage survive
 training-seed variance, and can CORE resolve the deltas at all?**
 
+### Depth-scaling at d20 (current phase)
+
+The d12 result is established and decisive: `embed_proj_dim=512` lowers val_bpb to
+1.7349 vs the 1.7889 baseline (9.4σ of training-seed variance, ~3% relative). The open
+question is whether this gain is **depth-dependent**: **does the input-projection val_bpb
+advantage scale with depth — persisting, or even growing, at d20 — or does it wash out as the
+model gains capacity** and the low-rank embedding correction becomes redundant? This phase
+re-runs the decisive baseline-vs-proj_512 comparison at d20 to find out.
+
 ## Setup
 
 Training function: `scripts/base_train.py` with `--embed-proj-dim` flag.
 Configs in `scripts/jobs/run_training.py` (`linear_projection_embedding_experiments`);
 evaluation via `scripts/jobs/run_evaluation.py` → `scripts/base_eval.py`. Code is the
 single source of truth for all hyperparameters, model selection, and job configs.
+
+### Depth-scaling (d20) arms
+
+Two arms, mirroring the decisive d12 comparison at greater depth:
+- **d20 + `embed_proj_dim=512`** (projection on)
+- **d20 + `embed_proj_dim=0`** (baseline, no projection)
+
+Each arm is trained with **3 independent training seeds** → **6 runs total**. The
+**primary metric is val_bpb, reported as mean ± std across the 3 seeds per arm**.
+**CORE is NOT a gate** for this phase: the d12 multi-seed phase showed run-to-run CORE
+variance of ±0.008, which exceeds the val_bpb-equivalent deltas of interest here, so CORE
+cannot reliably discriminate the arms and is reported only for reference. Exact seeds,
+depth, and all hyperparameters live in `scripts/jobs/run_training.py`
+(`linear_projection_embedding_experiments`) — code is the single source of truth.
 
 ### Investigation (reviewer-mandated): why is CORE insensitive across projection variants?
 
@@ -290,7 +313,18 @@ means is the **training-seed** std (the run-to-run noise the decision rule is me
   missing; the legacy single-run tags (`*_2b0bc792`, `*_9077cd29`, etc.) remain only for
   cross-reference and agree with the seeded means.
 
-## Conclusions
+## d20 depth-scaling phase
+
+### Results
+
+_Pending — d20 baseline vs proj_512, 3 training seeds per arm (6 runs). To be filled with
+val_bpb mean ± std per arm once the runs complete._
+
+### Conclusions
+
+_Pending._
+
+## Conclusions (d12)
 
 **Adopt `embed_proj_dim=512` as the d12 default.** Across 5 training seeds the zero-initialized
 low-rank embedding correction lowers val_bpb by **0.0540 ± (proj std 0.0058)** — from
@@ -359,3 +393,9 @@ CORE should not gate d12 model selection.
   ~0.005 delta and CORE disagrees with val_bpb at the seed level (proj_512 s4) → **drop CORE as
   a d12 selection metric**, confirming the noise-signature observation. Filled the multi-seed
   Results and rewrote Conclusions. Next: promote 512 to default, test at greater depth.
+- 2026-06-13: Started the **d20 depth-scaling phase**. Extended the Hypothesis to ask whether
+  the input-projection val_bpb gain scales with depth (persists/grows at d20) or washes out as
+  capacity increases. Two arms — d20 `embed_proj_dim=512` vs d20 `embed_proj_dim=0`, 3 training
+  seeds each (6 runs); primary metric val_bpb as mean ± std per arm. CORE is **not** a gate this
+  phase (d12 run-to-run CORE variance ±0.008 exceeds the deltas of interest). Results/Conclusions
+  left as placeholders. d12 content kept intact (decisive result above).
