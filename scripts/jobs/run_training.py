@@ -24,44 +24,61 @@ from typing import List
 
 
 def linear_projection_embedding_experiments() -> list[dict]:
-    """Linear projection embedding ablation: vary embed_proj_dim with d12 baseline."""
+    """Multi-seed validation of the two decisive embed-projection variants.
+
+    Narrowed (per the experiment plan's multi-seed validation phase) to the only two
+    variants that drive the d12 default decision: baseline (embed_proj_dim=0) and proj_512
+    (embed_proj_dim=512). The intermediate dims (128/256/1024/2048) from the original sweep
+    are intentionally dropped — the single-run sweep already located 512 as the val_bpb sweet
+    spot, so this phase spends its budget *confirming* that one comparison across training
+    seeds rather than re-sweeping.
+
+    Each variant is trained with multiple independent training seeds (--seed) to bound
+    run-to-run (training) variance — the noise source the single-run point estimate could not
+    see. One config is emitted per (variant, seed) pair, each with a unique model_tag that
+    encodes both the variant and the seed (e.g. d12_baseline_s0, d12_proj512_s3) so
+    checkpoints never collide and the results stage can group by variant. All other d12
+    hyperparameters are identical to the prior baseline run.
+    """
     experiment_group = "linear-projection-embeddings"
     experiment_slug = "linear_proj_emb"
     num_gpus = 4
     instance_type = "a100.4gpu"
     depth = 12
 
-    # Shared training args
+    # >=3 (5 preferred) independent training seeds to bound run-to-run variance.
+    training_seeds = [0, 1, 2, 3, 4]
+
+    # Shared training args (identical to the prior baseline run).
     shared_args = [
         f"--depth {depth}",
         "--window-pattern SSSL",
     ]
 
-    # Baseline: no projection (embed_proj_dim=0 is default, so we omit it)
+    # Only the two decisive variants. Baseline uses embed_proj_dim=0 (the default, omitted).
     variants = [
         ("baseline", "d12 baseline (no embed projection)", []),
-        ("proj_128", "d12 embed_proj_dim=128", ["--embed-proj-dim 128"]),
-        ("proj_256", "d12 embed_proj_dim=256", ["--embed-proj-dim 256"]),
-        ("proj_512", "d12 embed_proj_dim=512", ["--embed-proj-dim 512"]),
-        ("proj_1024", "d12 embed_proj_dim=1024", ["--embed-proj-dim 1024"]),
-        ("proj_2048", "d12 embed_proj_dim=2048", ["--embed-proj-dim 2048"]),
+        ("proj512", "d12 embed_proj_dim=512", ["--embed-proj-dim 512"]),
     ]
 
     configs = []
-    for tag, description, extra_args in variants:
-        args_parts = shared_args + extra_args
-        args_str = " ".join(args_parts).strip()
-        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
-        model_tag = f"d{depth}_{tag}_{cmd_hash}"
-        configs.append({
-            "args": args_str,
-            "model_tag": model_tag,
-            "description": description,
-            "cmd_hash": cmd_hash,
-            "instance_type": instance_type,
-            "experiment_slug": experiment_slug,
-            "num_gpus": num_gpus,
-        })
+    for tag, base_description, extra_args in variants:
+        for seed in training_seeds:
+            args_parts = shared_args + extra_args + [f"--seed {seed}"]
+            args_str = " ".join(args_parts).strip()
+            cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+            # model_tag encodes variant AND seed so checkpoints never collide and the
+            # results stage can group runs by variant.
+            model_tag = f"d{depth}_{tag}_s{seed}"
+            configs.append({
+                "args": args_str,
+                "model_tag": model_tag,
+                "description": f"{base_description} (seed {seed})",
+                "cmd_hash": cmd_hash,
+                "instance_type": instance_type,
+                "experiment_slug": experiment_slug,
+                "num_gpus": num_gpus,
+            })
     return configs
 
 

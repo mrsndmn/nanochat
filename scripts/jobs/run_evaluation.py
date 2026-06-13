@@ -99,9 +99,10 @@ def build_args() -> argparse.Namespace:
                         help="Only evaluate checkpoints whose model_tag contains this substring.")
     parser.add_argument("--max-per-task", type=int, default=-1,
                         help="Max examples per CORE task (-1 = all, passed to base_eval.py).")
-    parser.add_argument("--seeds", type=str, default="1337",
-                        help="Comma-separated eval seeds passed to base_eval.py. Multiple seeds "
-                             "produce CORE mean +/- std per variant.")
+    parser.add_argument("--seeds", type=str, default="1337,1338,1339,1340,1341",
+                        help="Comma-separated eval seeds passed to base_eval.py. Default is 5 "
+                             "distinct seeds so CORE gets a mean +/- std per checkpoint (eval "
+                             "seeds vary only CORE few-shot sampling; val_bpb is deterministic).")
 
     # Job description
     parser.add_argument("--author_name", default="ARKHIP (d.tarasov)", help="Author name tag for job description.")

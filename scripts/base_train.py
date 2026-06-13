@@ -77,6 +77,8 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# Reproducibility
+parser.add_argument("--seed", type=int, default=0, help="seed for all RNGs (torch/numpy/random). Controls weight init (incl. the embed projection); varies run-to-run for multi-seed studies")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -158,6 +160,23 @@ def build_model_meta(depth):
     with torch.device("meta"):
         model_meta = GPT(config)
     return model_meta
+
+# Seed all RNGs before model init + data loading so the run is reproducible and so that
+# distinct --seed values give genuinely different weight initializations (including the
+# zero-mean low_dim_embed projection init in GPT.init_weights). The bestfit dataloader is
+# deterministic (sequential parquet iteration, no shuffle), so weight init is the dominant
+# seed-dependent source of run-to-run variance; we offset per-rank only for any future
+# per-rank stochasticity while keeping the master process's init reproducible from --seed.
+import random as _random
+import numpy as _np
+def set_train_seed(seed: int):
+    _random.seed(seed)
+    _np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+set_train_seed(args.seed)
+print0(f"Seeded all RNGs with --seed {args.seed}")
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
