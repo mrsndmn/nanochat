@@ -65,6 +65,54 @@ def linear_projection_embedding_experiments() -> list[dict]:
     return configs
 
 
+def low_rank_unembedding_experiments() -> list[dict]:
+    """Low-rank unembedding (lm_head) correction ablation at d12.
+
+    Output-side analog of the validated input embedding projection
+    (embed_proj_dim=512, best in linear-projection-embeddings). Tests whether a
+    zero-initialized LoRA-style low-rank term added to the lm_head logits helps,
+    and whether input + output corrections compose. baseline and input proj_512
+    use identical args to the prior experiment so their checkpoints are reused.
+    """
+    experiment_group = "low-rank-unembedding"
+    experiment_slug = "low_rank_unembed"
+    num_gpus = 4
+    instance_type = "a100.4gpu"
+    depth = 12
+
+    # Shared training args (match linear-projection-embeddings for comparability)
+    shared_args = [
+        f"--depth {depth}",
+        "--window-pattern SSSL",
+    ]
+
+    variants = [
+        # (tag, description, extra_args) — baseline + input proj_512 reuse prior checkpoints
+        ("baseline", "d12 baseline (no projection)", []),
+        ("proj_512", "d12 input embed_proj_dim=512", ["--embed-proj-dim 512"]),
+        ("unembed_512", "d12 unembed_proj_dim=512", ["--unembed-proj-dim 512"]),
+        ("both_512", "d12 embed+unembed proj_dim=512",
+         ["--embed-proj-dim 512", "--unembed-proj-dim 512"]),
+    ]
+
+    configs = []
+    for tag, description, extra_args in variants:
+        args_parts = shared_args + extra_args
+        args_str = " ".join(args_parts).strip()
+        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+        model_tag = f"d{depth}_{tag}_{cmd_hash}"
+        configs.append({
+            "args": args_str,
+            "model_tag": model_tag,
+            "description": description,
+            "cmd_hash": cmd_hash,
+            "instance_type": instance_type,
+            "experiment_slug": experiment_slug,
+            "num_gpus": num_gpus,
+        })
+    return configs
+
+
 # ---------------------------------------------------------------------------
 # CLI and job submission
 # ---------------------------------------------------------------------------
@@ -125,7 +173,7 @@ if __name__ == "__main__":
     # Aggregate all experiment configs
     # -----------------------------------------------------------------------
     experiment_configs = [
-        *linear_projection_embedding_experiments(),
+        *low_rank_unembedding_experiments(),
     ]
 
     for experiment_config in experiment_configs:
