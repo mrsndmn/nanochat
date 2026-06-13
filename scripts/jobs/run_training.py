@@ -82,61 +82,63 @@ def linear_projection_embedding_experiments() -> list[dict]:
     return configs
 
 
-def linear_projection_embedding_d20_experiments() -> list[dict]:
-    """Depth-scaling (d20) of the decisive embed-projection comparison.
+def linear_projection_embeddings_10k() -> list[dict]:
+    """Longer-horizon (10k-step), single-seed re-test of the embed-projection comparison.
 
-    Mirrors `linear_projection_embedding_experiments` (the d12 multi-seed function) at greater
-    depth to answer the depth-scaling question from the plan: does the input-projection val_bpb
-    advantage persist (or grow) at d20, or wash out as the model gains capacity? Two arms only —
-    baseline (embed_proj_dim=0) and proj_512 (embed_proj_dim=512) — each trained with 3
-    independent training seeds (--seed) to bound run-to-run variance → 6 runs total. val_bpb
-    (mean ± std per arm) is the primary metric; CORE is reference-only this phase.
+    Continuation of `linear_projection_embedding_experiments`: re-tests whether the decisive
+    embed-projection variants improve over baseline when trained for a much longer horizon
+    (10k optimization steps via --num-iterations) instead of the prior short d12 budget. Two
+    arms only — baseline (embed_proj_dim=0) and proj_512 (embed_proj_dim=512) — at d12.
 
-    One config is emitted per (variant, seed) pair, each with a unique model_tag encoding depth,
-    proj dim, and seed (e.g. d20_proj0_s0, d20_proj512_s2) so checkpoints never collide with each
-    other or with the d12 runs, and the results stage can group by variant. Node settings match
-    every other job in this file (a100.4gpu / 4 GPUs — all jobs were standardized onto 4-GPU
-    nodes); larger depth does not use a different node here.
+    Single seed only: this phase deliberately drops the multi-seed fan-out. The d12 multi-seed
+    phase already established that the proj_512 val_bpb advantage clears 2σ of training-seed
+    variance with completely non-overlapping seed distributions, so a single seed suffices to
+    read the longer-horizon trend; no per-arm std is computed here.
+
+    The d20 depth-scaling and d6 configs have been cancelled and are not part of this group.
+
+    One config is emitted per variant, each with a unique model_tag (e.g. d12_baseline_10k,
+    d12_proj512_10k) so the 10k checkpoints never collide with the prior short-horizon runs.
+    Node settings match every other job in this file (a100.4gpu / 4 GPUs).
     """
     experiment_group = "linear-projection-embeddings"
     experiment_slug = "linear_proj_emb"
     num_gpus = 4
     instance_type = "a100.4gpu"
-    depth = 20
+    depth = 12
 
-    # 3 independent training seeds to bound run-to-run (training) variance per arm.
-    training_seeds = [0, 1, 2]
+    # Single seed only — no multi-seed fan-out this phase (see docstring).
+    seed = 0
 
-    # Shared training args (same as the d12 comparison, only depth differs).
+    # Longer training horizon: 10k explicit optimization steps.
     shared_args = [
         f"--depth {depth}",
         "--window-pattern SSSL",
+        "--num-iterations 10000",
     ]
 
-    # Two arms; the tag encodes proj dim explicitly (proj0 = baseline, no projection).
+    # Two arms; the tag encodes proj dim explicitly (baseline = no projection).
     variants = [
-        ("proj0", "d20 baseline (no embed projection)", []),
-        ("proj512", "d20 embed_proj_dim=512", ["--embed-proj-dim 512"]),
+        ("baseline", "d12 baseline (no embed projection), 10k steps", []),
+        ("proj512", "d12 embed_proj_dim=512, 10k steps", ["--embed-proj-dim 512"]),
     ]
 
     configs = []
     for tag, base_description, extra_args in variants:
-        for seed in training_seeds:
-            args_parts = shared_args + extra_args + [f"--seed {seed}"]
-            args_str = " ".join(args_parts).strip()
-            cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
-            # model_tag encodes depth, proj dim AND seed so checkpoints never collide and the
-            # results stage can group runs by variant.
-            model_tag = f"d{depth}_{tag}_s{seed}"
-            configs.append({
-                "args": args_str,
-                "model_tag": model_tag,
-                "description": f"{base_description} (seed {seed})",
-                "cmd_hash": cmd_hash,
-                "instance_type": instance_type,
-                "experiment_slug": experiment_slug,
-                "num_gpus": num_gpus,
-            })
+        args_parts = shared_args + extra_args + [f"--seed {seed}"]
+        args_str = " ".join(args_parts).strip()
+        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+        # model_tag encodes the 10k horizon so checkpoints never collide with the short runs.
+        model_tag = f"d{depth}_{tag}_10k"
+        configs.append({
+            "args": args_str,
+            "model_tag": model_tag,
+            "description": base_description,
+            "cmd_hash": cmd_hash,
+            "instance_type": instance_type,
+            "experiment_slug": experiment_slug,
+            "num_gpus": num_gpus,
+        })
     return configs
 
 
@@ -200,8 +202,7 @@ if __name__ == "__main__":
     # Aggregate all experiment configs
     # -----------------------------------------------------------------------
     experiment_configs = [
-        *linear_projection_embedding_experiments(),
-        *linear_projection_embedding_d20_experiments(),
+        *linear_projection_embeddings_10k(),
     ]
 
     for experiment_config in experiment_configs:
