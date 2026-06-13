@@ -17,12 +17,19 @@ list of config dicts (one per `base_train.py` invocation). To add an experiment:
 
 Default node: `a100.4gpu` (4 GPUs).
 
+**Training horizon & seeds:** training runs use **10k steps** (`--num-iterations 10000`).
+We **never launch multiple seeds** — every experiment config emits a **single seed only**
+(one training run per config). Do not replicate multi-seed fan-out; one run per arm.
+
 ## Running jobs
 
 Jobs are submitted to MLSpace via `scripts/jobs/`. The `mls` SDK is only imported at
 launch time, so the experiment functions can be imported/tested without it.
 
 ### Training
+
+Training runs use **10k steps** and a **single seed only** (no multi-seed fan-out —
+exactly one training run per experiment config).
 
 ```bash
 # Preview the commands that would be submitted (no SDK / no submission)

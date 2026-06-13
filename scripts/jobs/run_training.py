@@ -82,7 +82,7 @@ def linear_projection_embedding_experiments() -> list[dict]:
     return configs
 
 
-def linear_projection_embeddings_10k() -> list[dict]:
+def linear_projection_embeddings_10k_experiments() -> list[dict]:
     """Longer-horizon (10k-step), single-seed re-test of the embed-projection comparison.
 
     Continuation of `linear_projection_embedding_experiments`: re-tests whether the decisive
@@ -101,8 +101,10 @@ def linear_projection_embeddings_10k() -> list[dict]:
     d12_proj512_10k) so the 10k checkpoints never collide with the prior short-horizon runs.
     Node settings match every other job in this file (a100.4gpu / 4 GPUs).
     """
-    experiment_group = "linear-projection-embeddings"
-    experiment_slug = "linear_proj_emb"
+    experiment_group = "linear-projection-embeddings-10k"
+    # Distinct slug so this longer-horizon group never collides (in job_desc / grouping)
+    # with the original short-horizon multi-seed study.
+    experiment_slug = "linear-projection-embeddings-10k"
     num_gpus = 4
     instance_type = "a100.4gpu"
     depth = 12
@@ -202,7 +204,7 @@ if __name__ == "__main__":
     # Aggregate all experiment configs
     # -----------------------------------------------------------------------
     experiment_configs = [
-        *linear_projection_embeddings_10k(),
+        *linear_projection_embeddings_10k_experiments(),
     ]
 
     for experiment_config in experiment_configs:
