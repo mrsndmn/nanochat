@@ -168,6 +168,81 @@ def linear_projection_embeddings_10k_experiments() -> list[dict]:
     return configs
 
 
+def linear_projection_embeddings_10k_full_experiments() -> list[dict]:
+    """Fresh-tag, full-dataset single-epoch (<=1 epoch) re-run of the 10k-step comparison.
+
+    Why this exists: the prior `linear_projection_embeddings_10k_experiments` arms reuse the
+    tags `d12_baseline_10k` / `d12_proj512_10k`. Checkpoints already exist at those tags from
+    the original *multi-epoch* (58-epoch) run, so the launcher skipped re-training and the
+    intended single-epoch regime was never actually exercised — eval just re-read stale
+    weights (see experiments/linear-projection-embeddings-10k.md, 2026-06-13 anomalies).
+
+    This function emits the SAME experiment with DISTINCT model tags (suffix `_1ep`) so the
+    full-dataset single-epoch run launches as FRESH jobs instead of colliding with the old
+    checkpoints. Everything that defines the run — architecture, the linear-projection embed
+    mechanism (`--embed-proj-dim 512` on the proj arm), 10k steps (`--num-iterations 10000`),
+    the LR schedule, per-device batch size, gradient accumulation, sequence length, num_gpus,
+    and the global/effective batch size (524,288 tok/step, auto-computed at d12) — is BYTE-FOR-
+    BYTE identical to `linear_projection_embeddings_10k_experiments`. The only differences are
+    (a) the distinct `_1ep` model tags and slug, and (b) the already-committed ≤1-epoch data
+    extent (`--num-train-shards 150`).
+
+    Single seed only — no multi-seed fan-out (one config per arm), consistent with the rest of
+    this file and the 10k phase plan. d20/d6 remain cancelled and are not part of this group.
+    """
+    # Distinct slug so the fresh full-dataset run groups separately in job_desc / results from
+    # the stale-tag multi-epoch run that shared the `linear-projection-embeddings-10k` slug.
+    experiment_slug = "linear-projection-embeddings-10k-1ep"
+    num_gpus = 4
+    instance_type = "a100.4gpu"
+    depth = 12
+
+    # Single seed only — no multi-seed fan-out this phase.
+    seed = 0
+
+    # ------------------------------------------------------------------
+    # Data budget: identical to the prior 10k config — pin all 150 train shards so 10k steps
+    # at the (unchanged) 524,288 tok/step global batch consume ~0.78 epoch and the loader never
+    # wraps. 10k * 524,288 = 5.243e9 trained tokens; ~44.7e6 trained tokens/shard => >=118
+    # shards needed for one epoch; 150 provides headroom. We deliberately do NOT pass
+    # --device-batch-size / --max-seq-len / --total-batch-size, so the global/effective batch
+    # size stays EXACTLY as before.
+    # ------------------------------------------------------------------
+    num_train_shards = 150  # >= 118 required for >=1 epoch over 10k steps
+
+    shared_args = [
+        f"--depth {depth}",
+        "--window-pattern SSSL",
+        "--num-iterations 10000",
+        f"--num-train-shards {num_train_shards}",
+    ]
+
+    # Two arms; the tag encodes proj dim explicitly (baseline = no projection).
+    variants = [
+        ("baseline", "d12 baseline (no embed projection), 10k steps, full-dataset single-epoch (fresh tag)", []),
+        ("proj512", "d12 embed_proj_dim=512, 10k steps, full-dataset single-epoch (fresh tag)", ["--embed-proj-dim 512"]),
+    ]
+
+    configs = []
+    for tag, base_description, extra_args in variants:
+        args_parts = shared_args + extra_args + [f"--seed {seed}"]
+        args_str = " ".join(args_parts).strip()
+        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+        # `_1ep` suffix => distinct tag => fresh checkpoints, never colliding with the stale
+        # multi-epoch `d12_*_10k` checkpoints that caused the previous run to be skipped.
+        model_tag = f"d{depth}_{tag}_10k_1ep"
+        configs.append({
+            "args": args_str,
+            "model_tag": model_tag,
+            "description": base_description,
+            "cmd_hash": cmd_hash,
+            "instance_type": instance_type,
+            "experiment_slug": experiment_slug,
+            "num_gpus": num_gpus,
+        })
+    return configs
+
+
 # ---------------------------------------------------------------------------
 # CLI and job submission
 # ---------------------------------------------------------------------------
@@ -227,8 +302,12 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     # Aggregate all experiment configs
     # -----------------------------------------------------------------------
+    # Use the fresh-tag full-dataset single-epoch configs so the run launches as NEW jobs
+    # instead of colliding with the stale `d12_*_10k` multi-epoch checkpoints (which made the
+    # previous launch skip every job). The old function is kept for reference but no longer
+    # registered — its tags already have checkpoints and would just be skipped again.
     experiment_configs = [
-        *linear_projection_embeddings_10k_experiments(),
+        *linear_projection_embeddings_10k_full_experiments(),
     ]
 
     for experiment_config in experiment_configs:
