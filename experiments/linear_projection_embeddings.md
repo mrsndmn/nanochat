@@ -8,6 +8,16 @@ embedding quality with fewer trainable parameters than making the full embedding
 table trainable. The projection starts at zero (no initial perturbation) and
 learns a correction in a low-dimensional bottleneck space.
 
+### Multi-seed validation (current phase)
+
+The prior single-run result — `proj_512` (`embed_proj_dim=512`) lowering val_bpb by
+−0.0588 vs the no-projection baseline (`embed_proj_dim=0`) — is a **single point estimate**
+and needs multi-seed confirmation before it can drive the d12 default. In the same single-run
+data the **CORE ordering was uncorrelated with both val_bpb and `embed_proj_dim`**, i.e.
+consistent with noise rather than a real quality ranking, so CORE cannot yet be trusted to
+discriminate these variants. This phase asks: **does the proj_512 val_bpb advantage survive
+training-seed variance, and can CORE resolve the deltas at all?**
+
 ## Setup
 
 Training function: `scripts/base_train.py` with `--embed-proj-dim` flag.
@@ -209,6 +219,41 @@ change val_bpb (deterministic per checkpoint) and does **not** capture training-
 stochasticity. Establishing reliability therefore needs *both* (i) multiple **eval** seeds to
 bound few-shot sampling noise and (ii) multiple **training** seeds to bound run-to-run variance.
 
+## Multi-seed validation phase
+
+### Design
+
+Only **two** variants are retrained — **baseline** (`embed_proj_dim=0`) and **proj_512**
+(`embed_proj_dim=512`). The intermediate dims (128/256/1024/2048) are dropped; the single-run
+sweep already located 512 as the val_bpb sweet spot, so this phase spends its budget on
+*confirming* that one comparison rather than re-sweeping.
+
+- **Training seeds:** each variant is trained with **≥3 (5 preferred) independent training
+  seeds**, to bound run-to-run (training) variance — the noise source the single-run estimate
+  could not see.
+- **Eval seeds:** every checkpoint is evaluated with **≥5 eval seeds**, to bound CORE's
+  few-shot-sampling noise (eval seeds do not affect val_bpb, which is deterministic per
+  checkpoint).
+- **Reporting:** report **val_bpb and CORE as mean ± std per variant**.
+- **Metric roles:** **val_bpb is the PRIMARY metric**; CORE is **confirmatory only**.
+
+Exact seeds, seed counts, and configs live in `scripts/jobs/run_training.py`
+(`linear_projection_embedding_experiments`) and `scripts/jobs/run_evaluation.py` — code is the
+single source of truth; the above states intent, not values.
+
+### Decision rule
+
+- **Adopt `embed_proj_dim=512` as the d12 default *only if*** its val_bpb advantage over the
+  baseline **exceeds 2σ of the run-to-run (training-seed) variance**. Otherwise the
+  single-run gain is not distinguishable from a lucky seed and is not adopted.
+- **Drop CORE as a d12 selection metric** if, even at ≥5 eval seeds, it **cannot resolve the
+  ~0.005 deltas** between variants — in that case rely on val_bpb at d12 and, if needed,
+  confirm at greater depth / longer budget where CORE separates.
+
+### Results
+
+_(pending — multi-seed runs not yet completed)_
+
 ## Conclusions
 
 The zero-initialized low-rank embedding correction **helps**, consistently lowering val_bpb
@@ -259,3 +304,9 @@ low-dim projection helps. Whether it helps *CORE* is currently unanswerable.
   uncorrelated with val_bpb / `embed_proj_dim` → deltas consistent with noise. Filled the
   investigation Results; val_bpb stays primary (proj_512 best). Next: ≥5 eval seeds for CORE
   variance, ≥3 training seeds for baseline-vs-proj_512 run-to-run, report mean±std.
+- 2026-06-13: Started the **multi-seed validation phase**. Narrowed to two variants (baseline
+  vs. proj_512), each retrained with ≥3 (5 preferred) training seeds and evaluated with ≥5 eval
+  seeds, reporting val_bpb and CORE as mean ± std. Recorded the decision rule: adopt
+  `embed_proj_dim=512` as the d12 default only if its val_bpb advantage exceeds 2σ of
+  training-seed variance; drop CORE as a d12 selection metric if it cannot resolve ~0.005 deltas
+  at 5 eval seeds. val_bpb is primary, CORE confirmatory. Single-run findings left intact above.
