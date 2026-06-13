@@ -4,13 +4,15 @@ For each model under ``artifacts/base_checkpoints/<model_tag>/`` this picks the
 latest training step and reports:
 
 - ``val_bpb``     — validation bits-per-byte (from ``meta_<step>.json``)
-- ``CORE``        — CORE metric (mean centered accuracy over ICL tasks)
+- ``CORE``        — CORE metric (mean centered accuracy over ICL tasks), with ``CORE_std``
+                    across eval seeds when multiple seeds were run
 - ``depth``/``n_embd`` — model size, for context
 
-CORE is read from the canonical eval JSON
-(``artifacts/base_checkpoints/<tag>/evaluation/eval_<step>.json``, written by the
-eval pipeline) when present, otherwise from the per-step CSV that ``base_eval.py``
-writes to ``artifacts/base_eval/base_model_<step>.csv``.
+CORE is read from the canonical per-(model_tag, step) eval JSON
+(``artifacts/base_checkpoints/<tag>/evaluation/eval_<step>.json``, written by
+``base_eval.py``) when present, otherwise from the per-(model_tag, step) CSV
+``artifacts/base_eval/<tag>_<step>.csv``. Both are keyed by model_tag so distinct
+variants finishing at the same step never share a results file.
 
 Prints a GitHub-flavoured table to stdout (consumed by the research-loop results
 stage). No arguments are required; ``--artifacts`` / ``--tablefmt`` are optional.
@@ -24,8 +26,13 @@ from pathlib import Path
 from tabulate import tabulate
 
 
-def _read_core_from_json(checkpoint_dir: Path, step: int) -> float | None:
-    """Read the CORE metric from the canonical evaluation JSON, if it exists."""
+def _read_core_from_json(checkpoint_dir: Path, step: int) -> tuple[float, float | None, int] | None:
+    """Read CORE (mean, std, num_seeds) from the canonical evaluation JSON, if it exists.
+
+    The JSON is written by base_eval.py per (model_tag, step), so it is never shared across
+    variants. ``core`` is a dict carrying the across-seed mean/std; older single-value forms
+    are still accepted for backward compatibility.
+    """
     eval_file = checkpoint_dir / "evaluation" / f"eval_{step:06d}.json"
     if not eval_file.exists():
         return None
@@ -36,25 +43,40 @@ def _read_core_from_json(checkpoint_dir: Path, step: int) -> float | None:
         return None
     core = data.get("core")
     if isinstance(core, dict):
-        core = core.get("core_metric", core.get("metric"))
-    return core if isinstance(core, (int, float)) else None
+        mean = core.get("core_metric_mean", core.get("core_metric", core.get("metric")))
+        std = core.get("core_metric_std")
+        n = core.get("num_seeds", len(core.get("per_seed", {})) or 1)
+        if isinstance(mean, (int, float)):
+            return mean, std if isinstance(std, (int, float)) else None, int(n)
+        return None
+    if isinstance(core, (int, float)):
+        return core, None, 1
+    return None
 
 
-def _read_core_from_csv(artifacts_root: Path, step: int) -> float | None:
-    """Read the CORE metric from base_eval's per-step CSV (the 'CORE' summary row)."""
-    csv_path = artifacts_root / "base_eval" / f"base_model_{step:06d}.csv"
-    if not csv_path.exists():
-        return None
-    try:
-        with open(csv_path, newline="") as f:
-            for row in csv.reader(f):
-                cells = [c.strip() for c in row]
-                if cells and cells[0] == "CORE":
-                    # Row layout: Task, Accuracy, Centered -> CORE value is the last cell.
-                    value = cells[-1]
-                    return float(value) if value else None
-    except (OSError, ValueError):
-        return None
+def _read_core_from_csv(artifacts_root: Path, model_tag: str, step: int) -> tuple[float, None, int] | None:
+    """Read the CORE metric from base_eval's per-(model_tag, step) CSV (the 'CORE' row).
+
+    Fallback only — the canonical JSON is preferred. The CSV is keyed by ``{model_tag}_{step}``
+    (the old step-only ``base_model_{step}`` name is also checked for legacy artifacts).
+    """
+    candidates = [
+        artifacts_root / "base_eval" / f"{model_tag}_{step:06d}.csv",
+        artifacts_root / "base_eval" / f"base_model_{step:06d}.csv",
+    ]
+    for csv_path in candidates:
+        if not csv_path.exists():
+            continue
+        try:
+            with open(csv_path, newline="") as f:
+                for row in csv.reader(f):
+                    cells = [c.strip() for c in row]
+                    if cells and cells[0] == "CORE":
+                        # Row layout: Task, Accuracy, Centered -> CORE value is the last cell.
+                        value = cells[-1]
+                        return (float(value), None, 1) if value else None
+        except (OSError, ValueError):
+            continue
     return None
 
 
@@ -101,15 +123,20 @@ def collect_rows(artifacts_root: Path, model_filter: str | None) -> list[list[st
 
         cfg = meta.get("model_config", {})
         user_cfg = meta.get("user_config", {})
-        core = _read_core_from_json(model_dir, step)
-        if core is None:
-            core = _read_core_from_csv(artifacts_root, step)
+        core_stats = _read_core_from_json(model_dir, step)
+        if core_stats is None:
+            core_stats = _read_core_from_csv(artifacts_root, model_tag, step)
+        if core_stats is None:
+            core_mean, core_std, _n = None, None, 0
+        else:
+            core_mean, core_std, _n = core_stats
 
         rows.append([
             model_tag,
             str(step),
             _fmt(meta.get("val_bpb")),
-            _fmt(core),
+            _fmt(core_mean),
+            _fmt(core_std) if core_std else "",
             str(cfg.get("n_layer", user_cfg.get("depth", ""))),
             str(cfg.get("n_embd", "")),
         ])
@@ -146,7 +173,7 @@ def main() -> None:
         print("No checkpoints found.", flush=True)
         return
 
-    headers = ["model", "step", "val_bpb", "CORE", "n_layer", "n_embd"]
+    headers = ["model", "step", "val_bpb", "CORE", "CORE_std", "n_layer", "n_embd"]
     print(
         tabulate(rows, headers=headers, tablefmt=args.tablefmt, disable_numparse=True),
         flush=True,

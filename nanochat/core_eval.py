@@ -173,9 +173,13 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     continuation_delimiter = task_meta['continuation_delimiter']
 
     # Sample few-shot examples (excluding current item)
+    # The base seed is configurable (via task_meta['fewshot_seed']) so that multi-seed
+    # evaluation can vary the few-shot selection while remaining reproducible per seed.
+    # Defaults to 1234 to preserve the historical fixed-seed behavior.
+    fewshot_seed = task_meta.get('fewshot_seed', 1234)
     fewshot_examples = []
     if num_fewshot > 0:
-        rng = random.Random(1234 + idx)
+        rng = random.Random(fewshot_seed + idx)
         available_indices = [i for i in range(len(data)) if i != idx]
         fewshot_indices = rng.sample(available_indices, num_fewshot)
         fewshot_examples = [data[i] for i in fewshot_indices]

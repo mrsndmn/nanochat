@@ -51,22 +51,34 @@ def _find_last_step(checkpoint_dir: Path) -> int:
     return max(steps) if steps else -1
 
 
-def _has_eval_results(checkpoint_dir: Path, step: int, eval_modes: set) -> bool:
-    """Check if evaluation results already exist for the given step."""
+def _has_eval_results(checkpoint_dir: Path, step: int, eval_modes: set, seeds: List[int]) -> bool:
+    """Check if evaluation results already exist for the given step and seeds.
+
+    The canonical per-checkpoint file is evaluation/eval_{step:06d}.json (written by
+    base_eval.py). To avoid skipping on stale/partial results we require: the file exists,
+    it covers every requested eval mode, and (when CORE is requested) it covers every
+    requested seed. This is also what prevents a shared/step-only artifact from being
+    mistaken for a per-variant result.
+    """
     eval_dir = checkpoint_dir / "evaluation"
     if not eval_dir.is_dir():
         return False
-    # Check for results file: evaluation/eval_{step:06d}.json
     results_file = eval_dir / f"eval_{step:06d}.json"
     if not results_file.exists():
         return False
-    # Optionally check that the file contains the requested eval modes
     try:
         with open(results_file) as f:
             data = json.load(f)
-        return all(mode in data for mode in eval_modes)
     except (json.JSONDecodeError, OSError):
         return False
+    if not all(mode in data for mode in eval_modes):
+        return False
+    # When CORE is requested, require all requested seeds to be present.
+    if "core" in eval_modes:
+        done_seeds = set(str(s) for s in data.get("seeds", []))
+        if not all(str(s) in done_seeds for s in seeds):
+            return False
+    return True
 
 
 def build_args() -> argparse.Namespace:
@@ -87,6 +99,9 @@ def build_args() -> argparse.Namespace:
                         help="Only evaluate checkpoints whose model_tag contains this substring.")
     parser.add_argument("--max-per-task", type=int, default=-1,
                         help="Max examples per CORE task (-1 = all, passed to base_eval.py).")
+    parser.add_argument("--seeds", type=str, default="1337",
+                        help="Comma-separated eval seeds passed to base_eval.py. Multiple seeds "
+                             "produce CORE mean +/- std per variant.")
 
     # Job description
     parser.add_argument("--author_name", default="ARKHIP (d.tarasov)", help="Author name tag for job description.")
@@ -116,6 +131,15 @@ if __name__ == "__main__":
     invalid = eval_modes - set(EVAL_MODES)
     if invalid:
         print(f"Invalid eval modes: {invalid}. Valid: {set(EVAL_MODES)}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+    except ValueError:
+        print(f"Invalid --seeds: {args.seeds!r} (must be comma-separated integers)", file=sys.stderr)
+        sys.exit(1)
+    if not seeds:
+        print("No valid --seeds provided", file=sys.stderr)
         sys.exit(1)
 
     workdir = os.getcwd()
@@ -154,6 +178,23 @@ if __name__ == "__main__":
         sys.exit(0)
 
     _log(f"Found {len(model_tags)} model(s) to evaluate: {', '.join(model_tags)}", output_json)
+    _log(f"Eval seeds: {seeds}", output_json)
+
+    # Sanity check: each model_tag must resolve to a DISTINCT checkpoint dir + latest step.
+    # Identical (dir, step) across tags would mean variants share weights/results — the exact
+    # failure mode behind the flat-CORE artifact. Log the resolved triples and warn on any
+    # collision so it is visible rather than silent.
+    resolved = {}  # (resolved_dir, step) -> model_tag
+    for model_tag in model_tags:
+        checkpoint_dir = base_checkpoints_dir / model_tag
+        step = _find_last_step(checkpoint_dir)
+        key = (str(checkpoint_dir.resolve()), step)
+        _log(f"  resolved: model_tag={model_tag} step={step} path={checkpoint_dir.resolve()}", output_json)
+        if key in resolved:
+            _log(f"\033[31mWARNING: {model_tag} resolves to the SAME (path, step) as "
+                 f"{resolved[key]} — they would evaluate identical weights!\033[0m", output_json)
+        else:
+            resolved[key] = model_tag
 
     launched_jobs: List[dict] = []
 
@@ -164,12 +205,12 @@ if __name__ == "__main__":
             _log(f"\033[33mSkipping {model_tag}: no model checkpoints found\033[0m", output_json)
             continue
 
-        if _has_eval_results(checkpoint_dir, step, eval_modes) and not args.force:
+        if _has_eval_results(checkpoint_dir, step, eval_modes, seeds) and not args.force:
             _log(f"\033[33mSkipping {model_tag} step {step}: eval results already exist\033[0m", output_json)
             continue
 
         eval_str = ",".join(sorted(eval_modes))
-        extra_args = []
+        extra_args = [f"--seeds {','.join(str(s) for s in seeds)}"]
         if args.max_per_task > 0:
             extra_args.append(f"--max-per-task {args.max_per_task}")
         extra_str = " ".join(extra_args)
@@ -181,8 +222,9 @@ if __name__ == "__main__":
         if extra_str:
             base_cmd += f" {extra_str}"
 
+        seeds_str = ",".join(str(s) for s in seeds)
         job_desc = (
-            f"[nanochat/{experiment_slug}]: Eval {eval_str} model={model_tag} step={step} "
+            f"[nanochat/{experiment_slug}]: Eval {eval_str} model={model_tag} step={step} seeds={seeds_str} "
             f"#{author_name} #rnd #multimodal #notify_completed @{telegram_nick}"
         )
 
