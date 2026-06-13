@@ -82,6 +82,64 @@ def linear_projection_embedding_experiments() -> list[dict]:
     return configs
 
 
+def linear_projection_embedding_d20_experiments() -> list[dict]:
+    """Depth-scaling (d20) of the decisive embed-projection comparison.
+
+    Mirrors `linear_projection_embedding_experiments` (the d12 multi-seed function) at greater
+    depth to answer the depth-scaling question from the plan: does the input-projection val_bpb
+    advantage persist (or grow) at d20, or wash out as the model gains capacity? Two arms only —
+    baseline (embed_proj_dim=0) and proj_512 (embed_proj_dim=512) — each trained with 3
+    independent training seeds (--seed) to bound run-to-run variance → 6 runs total. val_bpb
+    (mean ± std per arm) is the primary metric; CORE is reference-only this phase.
+
+    One config is emitted per (variant, seed) pair, each with a unique model_tag encoding depth,
+    proj dim, and seed (e.g. d20_proj0_s0, d20_proj512_s2) so checkpoints never collide with each
+    other or with the d12 runs, and the results stage can group by variant. Node settings match
+    every other job in this file (a100.4gpu / 4 GPUs — all jobs were standardized onto 4-GPU
+    nodes); larger depth does not use a different node here.
+    """
+    experiment_group = "linear-projection-embeddings"
+    experiment_slug = "linear_proj_emb"
+    num_gpus = 4
+    instance_type = "a100.4gpu"
+    depth = 20
+
+    # 3 independent training seeds to bound run-to-run (training) variance per arm.
+    training_seeds = [0, 1, 2]
+
+    # Shared training args (same as the d12 comparison, only depth differs).
+    shared_args = [
+        f"--depth {depth}",
+        "--window-pattern SSSL",
+    ]
+
+    # Two arms; the tag encodes proj dim explicitly (proj0 = baseline, no projection).
+    variants = [
+        ("proj0", "d20 baseline (no embed projection)", []),
+        ("proj512", "d20 embed_proj_dim=512", ["--embed-proj-dim 512"]),
+    ]
+
+    configs = []
+    for tag, base_description, extra_args in variants:
+        for seed in training_seeds:
+            args_parts = shared_args + extra_args + [f"--seed {seed}"]
+            args_str = " ".join(args_parts).strip()
+            cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+            # model_tag encodes depth, proj dim AND seed so checkpoints never collide and the
+            # results stage can group runs by variant.
+            model_tag = f"d{depth}_{tag}_s{seed}"
+            configs.append({
+                "args": args_str,
+                "model_tag": model_tag,
+                "description": f"{base_description} (seed {seed})",
+                "cmd_hash": cmd_hash,
+                "instance_type": instance_type,
+                "experiment_slug": experiment_slug,
+                "num_gpus": num_gpus,
+            })
+    return configs
+
+
 # ---------------------------------------------------------------------------
 # CLI and job submission
 # ---------------------------------------------------------------------------
@@ -143,6 +201,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     experiment_configs = [
         *linear_projection_embedding_experiments(),
+        *linear_projection_embedding_d20_experiments(),
     ]
 
     for experiment_config in experiment_configs:
