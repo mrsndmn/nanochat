@@ -31,8 +31,16 @@ variants at d12).
 
 ## Results
 
-d12, single seed (s0). 10k-step runs (`d12_*_10k`). Eval reports the **final** step (10000).
-`min_val_bpb` and `train_bpb` are read from the run's `loop_state` / in-training eval.
+**The intended single-epoch re-run has not actually been trained yet; this eval pass re-read the
+prior multi-epoch checkpoints.** The ≤1-epoch reconfiguration (cap to 150 train shards via
+`--num-train-shards`, global batch size unchanged) is committed in code, but the two arms keep the
+same tags (`d12_baseline_10k`, `d12_proj512_10k`) and the launcher skips a tag whose checkpoint
+already exists. The evaluated `model_010000.pt` files predate the reconfiguration commit, their
+`meta` still reports `dataloader_state_dict.epoch = 58`, and `user_config` carries **no**
+`num_train_shards`. So the numbers below are **byte-identical to the previous multi-epoch run** — the
+single-epoch regime was never exercised.
+
+d12, single seed (s0), final step (10000):
 
 | arm           | final val_bpb (step 10000) | best val_bpb (min, in-training) | train bpb | epochs over shard | CORE (final) |
 |---------------|----------------------------|---------------------------------|-----------|-------------------|--------------|
@@ -40,65 +48,65 @@ d12, single seed (s0). 10k-step runs (`d12_*_10k`). Eval reports the **final** s
 | proj_512      | **2.3719**                 | 1.0457                          | 0.3447    | 58                | 0.0329       |
 | Δ (proj−base) | **−0.0805** (−3.3%)        | −0.0011 (−0.1%)                 | +0.0448   | —                 | −0.0103      |
 
-**Both arms severely overfit at the 10k horizon.** At d12 the data shard is small enough that
-10k steps loop it **58 times**; train bpb collapses to ~0.30 while val bpb climbs back up. The
-classic overfit U-curve is visible in the run state: val bpb bottoms out at **min_val_bpb ≈ 1.05**
-(hit mid-run) and then degrades to **~2.4 by step 10000**, which is what the eval pipeline reports.
+**Did single-epoch training change CORE/BPB vs the multi-epoch run? Unknown — nothing changed
+because nothing re-trained.** Both arms still show `epoch = 58`, train bpb ~0.30, and the classic
+overfit U-curve (val bpb bottoms at min_val_bpb ≈ 1.05 mid-run, then degrades to ~2.4 at step 10000,
+which is what eval reports). These are the *same* memorization-dominated checkpoints described in the
+prior update, not a corrected ≤0.78-epoch run.
 
-**Comparison vs the prior shorter-horizon runs (10k vs 2520 steps).** The prior multi-seed phase
-at step 2520 gave baseline **1.7889 ± 0.0025** vs proj_512 **1.7349 ± 0.0058** (Δ −0.0540, ≈ 3.0%,
-decisive 9.4σ). The 10k runs land at very different places depending on which checkpoint you read:
-- *At the in-training optimum* (min_val_bpb ≈ 1.046 for both arms) the longer horizon is **much
-  better than 2520** — the short runs were simply undertrained — but the proj_512 advantage
-  **collapses to −0.0011 bpb, i.e. the two arms are tied.**
-- *At the reported final step* proj_512 is nominally ahead (2.3719 vs 2.4524, Δ −0.0805, −3.3%),
-  but this is in the overfit regime and is driven by proj_512 **memorizing slightly less** (its
-  train bpb 0.3447 > baseline 0.2999), not by a genuine generalization gain.
+**Reference — prior shorter-horizon runs (2520 steps).** The multi-seed phase gave baseline
+**1.7889 ± 0.0025** vs proj_512 **1.7349 ± 0.0058** (Δ −0.0540, ≈ 3.0%, decisive 9.4σ). The 58-epoch
+10k checkpoints sit far worse at their final step (2.37–2.45) and only tie at their in-training
+optimum (1.0468 vs 1.0457, Δ −0.0011). The nominal final-step proj_512 lead (−0.0805) reflects
+slightly slower memorization (its train bpb 0.3447 > baseline 0.2999), not better generalization.
 
 **CORE.** proj_512 (0.0329) is *below* baseline (0.0432) at the final step, and both are below the
-2520-step seeded means (baseline 0.0541, proj_512 0.0630). Consistent with the established finding
-that CORE does not reliably discriminate these variants at d12 — and here both runs are degraded.
+2520-step seeded means (baseline 0.0541, proj_512 0.0630) — again the overfit-checkpoint artifact,
+not a single-epoch signal.
 
 ### Anomalies
 
-- **Overfitting / data exhaustion is the dominant effect**, not the projection. 58 epochs over the
-  shard, train bpb ~0.30, and a val-bpb U-curve mean the final-step val_bpb (2.37–2.45) measures
-  memorization, not quality. The genuinely best checkpoints (~1.046 bpb) are never evaluated.
-- **Eval reads the final step, not the best.** No best-checkpoint selection / early stopping is in
-  place, so the reported numbers are the post-overfit ones.
-- Single seed by design — no per-arm variance, so the −0.0805 final-step delta has no error bar.
+- **The single-epoch re-run did not run.** Same-tag checkpoints already existed, so the reconfigured
+  job was skipped (no `--force`); eval re-evaluated the stale 58-epoch weights. The "re-run results"
+  are therefore identical to the multi-epoch run and carry **no** information about the ≤1-epoch
+  regime. This is the headline issue to fix before any comparison is meaningful.
+- **Overfitting / data exhaustion still dominates** these (stale) checkpoints: 58 epochs over the
+  shard, train bpb ~0.30, val-bpb U-curve. The genuinely best checkpoints (~1.046 bpb) are never
+  evaluated.
+- **Eval reads the final step, not the best** — no best-`val_bpb` checkpoint selection / early
+  stopping, so reported numbers are the post-overfit ones.
+- Across the wider table the trustworthy signal stays at 2520 steps: best val_bpb is the proj_512
+  seeds/sweep (≈1.729) vs baseline seeds (≈1.787); best CORE is also proj_512
+  (s3 0.0684, s0 0.0677). `d12_proj512_s4` CORE 0.0464 is a low-seed outlier vs its ~0.066–0.068
+  siblings. `d12` (step 250) and `d6` (step 1000) are early/small reference checkpoints, not part of
+  this group.
 
 ## Conclusions
 
-**The 10k longer-horizon test is confounded by overfitting and does not show the projection's
-2520-step advantage persisting.** At the in-training val-bpb optimum the baseline and proj_512 arms
-are effectively **tied** (1.0468 vs 1.0457, Δ −0.0011), so the decisive −0.0540 bpb edge seen at
-2520 steps **washes out** once both arms are trained to their (much lower) best point. The only
-place proj_512 still leads is the final, overfit step (Δ −0.0805), and that reflects slightly
-slower memorization rather than better generalization. **At 10k steps the linear-projection
-embedding does not clearly improve over baseline** on the metric that matters (best val_bpb), and
-it is *worse* on CORE.
+**The corrected single-epoch comparison is still pending — it did not actually train.** The ≤1-epoch
+data budget is in code and the global batch size was left unchanged (524,288 tok/step, 10k steps), but
+because the arms reuse the existing `d12_*_10k` tags the reconfigured job was skipped and eval re-read
+the stale 58-epoch checkpoints. **CORE and BPB are therefore unchanged simply because the underlying
+weights are unchanged**; this pass gives no evidence either way about the single-epoch regime.
 
-A second, equally important takeaway: **the 10k horizon itself is the wrong setup for d12** — it
-loops the shard 58× and the model overfits long before step 10000. The useful signal (val bpb
-~1.046, well below the 1.79 of the 2520 runs) sits at the in-training minimum, which the pipeline
-neither saves nor evaluates.
+**The linear-projection conclusion is unaffected by this run and continues to rest on the 2520-step
+multi-seed finding** (proj_512 −0.0540 bpb, 9.4σ; see [[linear_projection_embeddings]]). It is neither
+confirmed nor refuted at a single-epoch 10k horizon yet. What the stale checkpoints still show — arms
+tied at their in-training optimum (1.0468 vs 1.0457) and proj_512 leading only at the overfit final
+step via slower memorization — remains a memorization artifact, not a quality signal, exactly as
+before.
 
 **Recommended next steps (in priority order):**
-1. **Fix the horizon / data budget.** Either add more data shards or cut the step count so training
-   stays at ≤1 epoch (or close to a Chinchilla-style data:param ratio). The current 58-epoch loop
-   makes any longer-horizon comparison a memorization test, not a quality test.
-2. **Evaluate the best checkpoint, not the final step.** Add best-`val_bpb` checkpoint saving (or
-   early stopping) so model selection and eval use the ~1.046-bpb minimum rather than the overfit
-   step-10000 weights.
-3. **Re-run baseline vs proj_512 at the corrected horizon** and compare at the best checkpoint.
-   Single seed is acceptable to read the trend; only escalate to multi-seed if the arms are close.
+1. **Actually launch the single-epoch re-run.** Re-submit with `--force` (or under fresh tags) so the
+   150-shard / ≤0.78-epoch config produces new checkpoints instead of being skipped. Until then there
+   is nothing single-epoch to analyze.
+2. **Evaluate the best checkpoint, not the final step.** Add best-`val_bpb` checkpoint saving / early
+   stopping so model selection uses the val-bpb minimum rather than overfit step-10000 weights — this
+   matters even once data no longer wraps.
+3. **Then compare baseline vs proj_512 at the corrected horizon.** Single seed is acceptable to read
+   the trend; escalate to multi-seed only if the arms are close.
 4. **Keep val_bpb primary; do not gate on CORE at d12** — it is uninformative here (proj_512 even
-   regresses) as already established by the multi-seed phase.
-
-The decisive, trustworthy result remains the 2520-step multi-seed finding (proj_512 −0.0540 bpb,
-9.4σ); see [[linear_projection_embeddings]]. This 10k phase does **not** extend it to a longer
-horizon — it instead surfaces an overfitting / checkpoint-selection problem to fix first.
+   regresses on these checkpoints), as established by the multi-seed phase.
 
 ## Changelog
 
@@ -114,3 +122,12 @@ horizon — it instead surfaces an overfitting / checkpoint-selection problem to
   final step (2.3719 vs 2.4524) via slower memorization, and is worse on CORE (0.0329 vs 0.0432).
   Conclusion: 10k does not show a persisting projection gain; the horizon itself is misconfigured.
   Next: fix data budget (≤1 epoch), evaluate/save best checkpoint, re-run at corrected horizon.
+- 2026-06-13: Reconfigured the group to ≤1 epoch on the expanded data (cap to 150 train shards via
+  `--num-train-shards`, **global batch size unchanged** at 524,288 tok/step, still 10k steps,
+  single seed). Re-ran the eval pipeline — but the **single-epoch training never actually executed**:
+  the arms reuse the same `d12_*_10k` tags, the existing checkpoints blocked the job (no `--force`),
+  and eval re-read the stale 58-epoch weights. Outcome: CORE/BPB **identical** to the prior
+  multi-epoch run (baseline 2.4524 / 0.0432, proj_512 2.3719 / 0.0329; both `epoch=58`, no
+  `num_train_shards` in meta), so this pass yields **no** single-epoch signal. The linear-projection
+  conclusion is unchanged and still rests on the 2520-step multi-seed result. Next: re-launch the
+  single-epoch run with `--force` (or fresh tags), then compare at the best checkpoint.
