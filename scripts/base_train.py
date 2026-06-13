@@ -163,10 +163,11 @@ def build_model_meta(depth):
 
 # Seed all RNGs before model init + data loading so the run is reproducible and so that
 # distinct --seed values give genuinely different weight initializations (including the
-# zero-mean low_dim_embed projection init in GPT.init_weights). The bestfit dataloader is
-# deterministic (sequential parquet iteration, no shuffle), so weight init is the dominant
-# seed-dependent source of run-to-run variance; we offset per-rank only for any future
-# per-rank stochasticity while keeping the master process's init reproducible from --seed.
+# zero-mean low_dim_embed projection init in GPT.init_weights). The same seed is applied on
+# every rank on purpose: init_weights runs independently per rank, so an identical seed is
+# what keeps the DDP replicas bit-identical at init. The bestfit dataloader is deterministic
+# (sequential parquet iteration, no shuffle, no RNG/workers), so weight init is the dominant
+# seed-dependent source of run-to-run variance this multi-seed study is measuring.
 import random as _random
 import numpy as _np
 def set_train_seed(seed: int):
