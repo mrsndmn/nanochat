@@ -83,23 +83,28 @@ def linear_projection_embedding_experiments() -> list[dict]:
 
 
 def linear_projection_embeddings_10k_experiments() -> list[dict]:
-    """Longer-horizon (10k-step), single-seed re-test of the embed-projection comparison.
+    """10k-step, single-seed ablation over the embedding projection dimension.
 
-    Continuation of `linear_projection_embedding_experiments`: re-tests whether the decisive
-    embed-projection variants improve over baseline when trained for a much longer horizon
-    (10k optimization steps via --num-iterations) instead of the prior short d12 budget. Two
-    arms only — baseline (embed_proj_dim=0) and proj_512 (embed_proj_dim=512) — at d12.
+    Iteration 1 of an autonomous search for a low-dim linear embedding projection that
+    matches/beats the full-embedding baseline at the 10k horizon (on CORE and BPB). The
+    projection adds a low-rank learnable term `embed_proj(low_dim_embed(idx))` summed with
+    `wte` (see nanochat/gpt.py) — a low-rank factorization of the embedding correction whose
+    rank is set by --embed-proj-dim. We sweep that rank to locate a sweet spot: too small
+    under-parameterizes the correction, too large recovers the baseline.
 
-    Single seed only: this phase deliberately drops the multi-seed fan-out. The d12 multi-seed
-    phase already established that the proj_512 val_bpb advantage clears 2σ of training-seed
-    variance with completely non-overlapping seed distributions, so a single seed suffices to
-    read the longer-horizon trend; no per-arm std is computed here.
+    Arms (all at d12, identical hyperparameters apart from --embed-proj-dim):
+      - baseline: no projection (embed_proj_dim=0, the default — flag omitted).
+      - proj128 / proj256 / proj512 / proj1024: --embed-proj-dim in {128, 256, 512, 1024}.
 
-    The d20 depth-scaling and d6 configs have been cancelled and are not part of this group.
+    Single seed only: this phase deliberately drops the multi-seed fan-out — exactly one
+    training run per arm. The prior d12 multi-seed phase already established that the proj_512
+    val_bpb advantage clears 2σ of training-seed variance, so a single seed suffices to read
+    the dimension-sweep trend; no per-arm std is computed here.
 
-    One config is emitted per variant, each with a unique model_tag (e.g. d12_baseline_10k,
-    d12_proj512_10k) so the 10k checkpoints never collide with the prior short-horizon runs.
-    Node settings match every other job in this file (a100.4gpu / 4 GPUs).
+    One config is emitted per arm, each with a unique model_tag (e.g. d12_baseline_10k,
+    d12_proj128_10k, …, d12_proj1024_10k) that encodes the projection dim so the 10k
+    checkpoints and eval results are unambiguous and never collide with prior runs. Node
+    settings match every other job in this file (a100.4gpu / 4 GPUs).
     """
     experiment_group = "linear-projection-embeddings-10k"
     # Distinct slug so this longer-horizon group never collides (in job_desc / grouping)
@@ -112,18 +117,27 @@ def linear_projection_embeddings_10k_experiments() -> list[dict]:
     # Single seed only — no multi-seed fan-out this phase (see docstring).
     seed = 0
 
-    # Longer training horizon: 10k explicit optimization steps.
+    # Embedding projection dims to sweep (0 = baseline / no projection is added separately).
+    proj_dims = [128, 256, 512, 1024]
+
+    # Longer training horizon: 10k explicit optimization steps. Identical across all arms so
+    # the only varying factor is the embedding projection dimension.
     shared_args = [
         f"--depth {depth}",
         "--window-pattern SSSL",
         "--num-iterations 10000",
     ]
 
-    # Two arms; the tag encodes proj dim explicitly (baseline = no projection).
+    # Arms; the tag encodes proj dim explicitly (baseline = no projection).
     variants = [
         ("baseline", "d12 baseline (no embed projection), 10k steps", []),
-        ("proj512", "d12 embed_proj_dim=512, 10k steps", ["--embed-proj-dim 512"]),
     ]
+    for dim in proj_dims:
+        variants.append((
+            f"proj{dim}",
+            f"d12 embed_proj_dim={dim}, 10k steps",
+            [f"--embed-proj-dim {dim}"],
+        ))
 
     configs = []
     for tag, base_description, extra_args in variants:
