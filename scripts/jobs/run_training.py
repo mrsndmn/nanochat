@@ -83,23 +83,34 @@ def linear_projection_embedding_experiments() -> list[dict]:
 
 
 def linear_projection_embeddings_10k_experiments() -> list[dict]:
-    """Longer-horizon (10k-step), single-seed re-test of the embed-projection comparison.
+    """10k-step, single-seed *dimension ablation* over the embed-projection width.
 
-    Continuation of `linear_projection_embedding_experiments`: re-tests whether the decisive
-    embed-projection variants improve over baseline when trained for a much longer horizon
-    (10k optimization steps via --num-iterations) instead of the prior short d12 budget. Two
-    arms only — baseline (embed_proj_dim=0) and proj_512 (embed_proj_dim=512) — at d12.
+    Reframes the longer-horizon embed-projection study (continuation of
+    `linear_projection_embedding_experiments`) from a single baseline-vs-proj_512 comparison
+    into a clean **sweep of `--embed-proj-dim`** at d12 / 10k steps. The goal is to bracket the
+    crossover with the dense baseline: find the smallest low-dim linear projection whose
+    CORE/BPB is at least as good as the dense embedding while using fewer embedding parameters.
 
-    Single seed only: this phase deliberately drops the multi-seed fan-out. The d12 multi-seed
-    phase already established that the proj_512 val_bpb advantage clears 2σ of training-seed
-    variance with completely non-overlapping seed distributions, so a single seed suffices to
-    read the longer-horizon trend; no per-arm std is computed here.
+    Ablation grid. d12 has model_dim = depth * aspect_ratio = 12 * 64 = 768, so the dense
+    embedding (wte) is vocab x 768. We sweep a small -> moderate set of projection widths that
+    sit below the dense width and bracket the previously-observed proj_512 sweet spot:
+
+        embed_proj_dim in {64, 128, 256, 512}   (small / medium / large low-dim projections)
+
+    alongside the **dense baseline** (`embed_proj_dim=0`, no projection) as the reference arm.
+    One config is emitted per dimension — exactly one run per arm.
+
+    Single seed only: this phase deliberately drops the multi-seed fan-out (project convention:
+    one training run per config). The d12 multi-seed phase already established that the
+    proj_512 val_bpb advantage clears 2σ of training-seed variance, so a single seed suffices
+    to read the dimension trend; no per-arm std is computed here.
 
     The d20 depth-scaling and d6 configs have been cancelled and are not part of this group.
 
-    One config is emitted per variant, each with a unique model_tag (e.g. d12_baseline_10k,
-    d12_proj512_10k) so the 10k checkpoints never collide with the prior short-horizon runs.
-    Node settings match every other job in this file (a100.4gpu / 4 GPUs).
+    Each config carries a unique model_tag that encodes the projection dim (e.g.
+    d12_baseline_10k, d12_proj064_10k, d12_proj512_10k) so the 10k checkpoints and eval
+    results never collide with each other or with the prior short-horizon runs. Node settings
+    match every other job in this file (a100.4gpu / 4 GPUs).
     """
     experiment_group = "linear-projection-embeddings-10k"
     # Distinct slug so this longer-horizon group never collides (in job_desc / grouping)
@@ -143,10 +154,21 @@ def linear_projection_embeddings_10k_experiments() -> list[dict]:
         f"--num-train-shards {num_train_shards}",
     ]
 
-    # Two arms; the tag encodes proj dim explicitly (baseline = no projection).
+    # Low-dim projection widths to sweep (all < dense model_dim=768), bracketing the
+    # crossover with the dense baseline. The baseline arm (embed_proj_dim=0) omits the flag.
+    proj_dims = [64, 128, 256, 512]
+
+    # Reference arm first, then one arm per projection dim.
     variants = [
         ("baseline", "d12 baseline (no embed projection), 10k steps", []),
-        ("proj512", "d12 embed_proj_dim=512, 10k steps", ["--embed-proj-dim 512"]),
+    ]
+    variants += [
+        (
+            f"proj{dim:03d}",
+            f"d12 embed_proj_dim={dim}, 10k steps",
+            [f"--embed-proj-dim {dim}"],
+        )
+        for dim in proj_dims
     ]
 
     configs = []
@@ -154,7 +176,8 @@ def linear_projection_embeddings_10k_experiments() -> list[dict]:
         args_parts = shared_args + extra_args + [f"--seed {seed}"]
         args_str = " ".join(args_parts).strip()
         cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
-        # model_tag encodes the 10k horizon so checkpoints never collide with the short runs.
+        # model_tag encodes the projection dim AND the 10k horizon so checkpoints never
+        # collide with each other or with the short runs.
         model_tag = f"d{depth}_{tag}_10k"
         configs.append({
             "args": args_str,

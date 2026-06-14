@@ -1,35 +1,37 @@
-# Linear Projection Embeddings — 10k-step single-seed
+# Linear Projection Embeddings — 10k-step dimension ablation
 
 ## Hypothesis
 
-Re-test whether the linear projection embedding configs improve over the no-projection
-baseline when trained for a **longer horizon (10k steps)** with a **single seed**. The
-prior d12 result established the proj_512 val_bpb advantage at a short training budget; this
-phase asks whether that advantage persists, grows, or washes out once both arms are trained
-much longer. See [[linear_projection_embeddings]] for the original short-horizon study.
+There exists a **low-dimensional linear projection dimension** at which the
+parameter-efficient projected embeddings **match or exceed the dense baseline** on
+CORE/BPB when trained for **10k steps** at d12. Earlier phases compared only a single
+projection width (proj_512) against baseline; this phase reframes the question as a
+**dimension sweep**: by ablating the projection dimension over a range of low values we
+expect to find a dimension (and any accompanying recipe) where the projected model is at
+least as good as the dense baseline while using fewer embedding parameters. See
+[[linear_projection_embeddings]] for the original short-horizon study.
 
 ## Setup
 
-Training function: `linear_projection_embeddings_10k` in `scripts/jobs/run_training.py`
-(source of truth for all hyperparameters, step counts, model selection, and job configs).
-Evaluation via `scripts/jobs/run_evaluation.py` → `scripts/base_eval.py`. Default job:
-`num_gpus=4`, `instance_type=a100.4gpu`; checkpoints/artifacts under
-`$NANOCHAT_BASE_DIR/base_checkpoints/<model_tag>/`.
+Training function: `linear_projection_embeddings_10k_experiments` in
+`scripts/jobs/run_training.py` (source of truth for all hyperparameters, step counts,
+the ablation grid, model selection, and job configs). The projection width is controlled
+by the `--embed-proj-dim` parameter on `scripts/base_train.py` (`embed_proj_dim=0` =
+dense baseline, no projection). Evaluation via `scripts/jobs/run_evaluation.py` →
+`scripts/base_eval.py`. Default job: `num_gpus=4`, `instance_type=a100.4gpu`;
+checkpoints/artifacts under `$NANOCHAT_BASE_DIR/base_checkpoints/<model_tag>/`.
 
-Rationale for this group:
-- **(a) Longer horizon.** Training now uses **10k steps** for this group, instead of the
-  short budget used by the original d12 phase.
-- **(b) Single seed only.** No multi-seed fan-out — the prior multi-seed phase already showed
-  the proj_512 advantage clears 2σ of training-seed variance with non-overlapping seed
-  distributions, so one seed suffices to read the longer-horizon trend.
-- **(c) d20 / d6 cancelled.** The d20 depth-scaling and d6 configs have been removed/cancelled
-  and are **not** part of this group; this phase stays at d12 and varies only the training
-  horizon.
-
-val_bpb is the primary metric; CORE is reference-only (it did not reliably discriminate these
-variants at d12).
+**Ablation grid.** Sweep `--embed-proj-dim` over a range of **low projection dimensions**
+(small → moderate widths) at d12 / 10k steps, single seed, alongside the **dense baseline**
+(`embed_proj_dim=0`) as the reference arm. One config is emitted per dimension with a
+distinct `model_tag`. The exact set of dimensions lives in the training function — see code
+for the concrete values. Single seed only (no multi-seed fan-out, per project convention).
+Primary metrics are **CORE and BPB**; the objective is to identify the smallest projection
+dimension whose CORE/BPB is **≥ baseline**.
 
 ## Results
+
+### Phase 1 — baseline vs proj_512 (completed)
 
 **The single-epoch re-run actually trained this time.** Fresh job configs with distinct `_1ep` model
 tags (`d12_baseline_10k_1ep`, `d12_proj512_10k_1ep`) were launched so the ≤1-epoch run could not be
@@ -79,6 +81,11 @@ Comparison across regimes (proj_512 vs baseline):
   (s3 0.0684, s0 0.0677). `d12_proj512_s4` CORE 0.0464 is a low-seed outlier vs its ~0.066–0.068
   siblings. `d12` (step 250, CORE −0.0136) and `d6` (step 1000) are early/small reference checkpoints,
   not part of this group.
+
+### Phase 2 — dimension ablation (pending)
+
+_To be filled after the `--embed-proj-dim` dimension-ablation runs complete: report whether any
+low projection dimension beats the dense baseline on CORE/BPB, and which dimension/recipe wins._
 
 ## Conclusions
 
@@ -138,3 +145,8 @@ data. The projection mechanism neither helps nor hurts at this scale and horizon
   0.8050 / 0.1796; Δ val_bpb +0.0012, CORE −0.0008 ≈ 0.3σ). The decisive 2520-step proj_512 advantage
   (−0.0540 bpb, 9.4σ) **washes out** once data no longer repeats — linear projection shows no
   advantage at the single-epoch 10k horizon.
+- 2026-06-14: **Reframed Phase 2 as a dimension ablation.** Rather than a single projection width,
+  the next phase sweeps `--embed-proj-dim` over a range of low dimensions to find the dimension (and
+  any accompanying recipe) at which projected embeddings **beat the dense baseline on CORE/BPB** at
+  10k steps. Phase 1's baseline-vs-proj_512 results above stand as the completed prior phase;
+  Phase 2 Results/Conclusions are placeholders pending the new runs.
