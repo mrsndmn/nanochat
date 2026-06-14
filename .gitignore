@@ -11,5 +11,5 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
-artifacts/
+artifacts
 run/
