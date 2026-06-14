@@ -5,6 +5,7 @@ Common utilities for nanochat.
 import os
 import re
 import logging
+import subprocess
 import urllib.request
 import torch
 import torch.distributed as dist
@@ -67,6 +68,66 @@ def setup_default_logging():
 setup_default_logging()
 logger = logging.getLogger(__name__)
 
+def _ensure_worktree_artifacts_symlink(base_dir):
+    """Recreate the per-worktree ``artifacts`` symlink when an Arkhip git worktree was
+    created without it.
+
+    Training/eval jobs export ``NANOCHAT_BASE_DIR=<workdir>/artifacts``. In the main
+    checkout and in correctly-prepared worktrees this ``artifacts`` is a symlink to the
+    shared artifacts dir (tokenizer + base data). New worktrees are sometimes created
+    without that symlink; ``get_base_dir`` would then ``os.makedirs`` an empty *real*
+    directory, masking the missing data and failing fast at ``get_tokenizer()``.
+
+    When we detect a linked git worktree whose ``artifacts`` entry is missing (or an
+    empty real dir) and the main checkout has an ``artifacts`` to point at, recreate the
+    symlink to match the sibling worktrees. No-op for non-worktree or non-``artifacts``
+    base dirs, for an existing symlink, or for a non-empty real dir (never clobber data).
+    """
+    base_dir = os.path.normpath(base_dir)
+    if os.path.basename(base_dir) != "artifacts":
+        return
+    if os.path.islink(base_dir):
+        return  # already configured — respect whatever it points at
+    if os.path.isdir(base_dir) and os.listdir(base_dir):
+        return  # real data lives here; do not touch
+
+    worktree_root = os.path.dirname(base_dir)
+    try:
+        common = subprocess.run(
+            ["git", "-C", worktree_root, "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        gitdir = subprocess.run(
+            ["git", "-C", worktree_root, "rev-parse", "--git-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return  # not a git checkout (or git unavailable) — leave base_dir alone
+
+    # git may return paths relative to worktree_root; make them absolute to compare.
+    common_abs = common if os.path.isabs(common) else os.path.join(worktree_root, common)
+    gitdir_abs = gitdir if os.path.isabs(gitdir) else os.path.join(worktree_root, gitdir)
+    if os.path.normpath(common_abs) == os.path.normpath(gitdir_abs):
+        return  # main checkout, not a linked worktree — nothing to recreate
+
+    # Main checkout root is the parent of the shared (common) .git dir.
+    main_root = os.path.dirname(os.path.normpath(common_abs))
+    main_artifacts = os.path.join(main_root, "artifacts")
+    if not (os.path.exists(main_artifacts) or os.path.islink(main_artifacts)):
+        return  # nothing to point at
+
+    try:
+        if os.path.isdir(base_dir) and not os.path.islink(base_dir):
+            os.rmdir(base_dir)  # empty (checked above)
+        os.symlink(main_artifacts, base_dir)
+        logger.info("Created worktree artifacts symlink: %s -> %s", base_dir, main_artifacts)
+    except FileExistsError:
+        pass  # another rank won the race
+    except OSError as e:
+        # Lost a race (dir vanished) or FS refused the link — fine if a link now exists.
+        if not os.path.islink(base_dir):
+            logger.warning("Could not create worktree artifacts symlink %s: %s", base_dir, e)
+
 def get_base_dir():
     # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
     if os.environ.get("NANOCHAT_BASE_DIR"):
@@ -75,6 +136,7 @@ def get_base_dir():
         home_dir = os.path.expanduser("~")
         cache_dir = os.path.join(home_dir, ".cache")
         nanochat_dir = os.path.join(cache_dir, "nanochat")
+    _ensure_worktree_artifacts_symlink(nanochat_dir)
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 
