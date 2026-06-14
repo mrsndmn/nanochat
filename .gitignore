@@ -11,5 +11,8 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+# Environment-managed artifacts dir (tokenizer, base data, checkpoints).
+# Ignore it whether it is a real directory or a symlink to a shared location.
 artifacts
+artifacts/
 run/
