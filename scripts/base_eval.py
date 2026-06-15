@@ -33,7 +33,7 @@ import torch
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
-from nanochat.checkpoint_manager import load_model
+from nanochat.checkpoint_manager import load_model, find_largest_model, find_last_step
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
@@ -202,6 +202,48 @@ def _summarize(values):
 
 
 # -----------------------------------------------------------------------------
+# Idempotency: per-checkpoint eval results live in <checkpoint_dir>/evaluation/eval_<step>.json
+
+# Eval modes that persist a result into the eval JSON ('sample' is stdout-only).
+PERSISTENT_EVAL_MODES = {"core", "bpb"}
+
+
+def _eval_json_path(checkpoint_dir, step):
+    return os.path.join(checkpoint_dir, "evaluation", f"eval_{step:06d}.json")
+
+
+def _load_existing_eval(checkpoint_dir, step):
+    """Return the parsed per-checkpoint eval record, or None if absent/unreadable."""
+    path = _eval_json_path(checkpoint_dir, step)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _eval_already_complete(checkpoint_dir, step, eval_modes, seeds):
+    """True iff the saved eval record already covers every requested persistent mode
+    (core/bpb) and, for CORE, every requested seed. 'sample' writes no artifact, so it
+    never counts toward (nor blocks) completeness."""
+    data = _load_existing_eval(checkpoint_dir, step)
+    if data is None:
+        return False
+    required = {m for m in eval_modes if m in PERSISTENT_EVAL_MODES}
+    if not required:
+        return False  # e.g. a sample-only request: nothing persistent to reuse
+    if not all(m in data for m in required):
+        return False
+    if "core" in required:
+        done_seeds = {str(s) for s in data.get("seeds", [])}
+        if not all(str(s) in done_seeds for s in seeds):
+            return False
+    return True
+
+
+# -----------------------------------------------------------------------------
 # Main
 
 def main():
@@ -215,6 +257,7 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    parser.add_argument('--force', action='store_true', help='Re-run evaluation even if results already exist for this checkpoint.')
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -244,28 +287,35 @@ def main():
         model_tag = args.hf_path.replace("/", "-")
         model_slug = model_tag
     else:
-        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
+        # Resolve the checkpoint (model_tag + step) WITHOUT loading weights first, so an
+        # already-evaluated checkpoint can be skipped before the expensive model build and
+        # eval-bundle download. Auto-guess the largest model tag when none is given; this
+        # also catches the case where two variants collide on a single model_tag.
+        base_dir = get_base_dir()
+        checkpoints_root = os.path.join(base_dir, "base_checkpoints")
+        model_tag = args.model_tag if args.model_tag else find_largest_model(checkpoints_root)
+        checkpoint_dir = os.path.join(checkpoints_root, model_tag)
+        resolved_step = args.step if args.step is not None else find_last_step(checkpoint_dir)
+        checkpoint_path = os.path.join(checkpoint_dir, f"model_{resolved_step:06d}.pt")
+        print0(f"Resolved checkpoint: model_tag={model_tag} | step={resolved_step} | path={checkpoint_path}")
+
+        # Idempotency: if every requested persistent eval (core/bpb) already exists for this
+        # exact checkpoint + seeds, do nothing. All ranks read the same JSON and decide alike.
+        if not args.force and _eval_already_complete(checkpoint_dir, resolved_step, eval_modes, seeds):
+            print0(f"Eval results already complete for model_tag={model_tag} step={resolved_step} "
+                   f"(modes={sorted(eval_modes)}, seeds={seeds}); skipping. Use --force to re-run.")
+            compute_cleanup()
+            return
+
+        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=model_tag, step=resolved_step)
         sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
         resolved_step = meta['step']
-        # Resolve the model tag (auto-guessing the largest model when not given) and the
-        # on-disk checkpoint path so they are logged explicitly. This catches the case where
-        # two variants collide on a single model_tag and would silently evaluate one model.
-        base_dir = get_base_dir()
-        checkpoints_root = os.path.join(base_dir, "base_checkpoints")
-        if args.model_tag:
-            model_tag = args.model_tag
-        else:
-            from nanochat.checkpoint_manager import find_largest_model
-            model_tag = find_largest_model(checkpoints_root)
-        checkpoint_dir = os.path.join(checkpoints_root, model_tag)
-        checkpoint_path = os.path.join(checkpoint_dir, f"model_{resolved_step:06d}.pt")
         model_name = f"base_model (step {resolved_step})"
         # Key all CORE artifacts by model_tag AND step so that distinct variants that finish
         # at the same step never overwrite each other's results (the prior step-only slug
         # `base_model_<step>` was the root cause of identical CORE across variants).
         model_slug = f"{model_tag}_{resolved_step:06d}"
-        print0(f"Resolved checkpoint: model_tag={model_tag} | step={resolved_step} | path={checkpoint_path}")
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
@@ -375,17 +425,18 @@ def main():
     # results.py / run_evaluation.py read this file, keyed by (model_tag, step). Writing it
     # here is what stops the step-only CSV fallback (the source of identical CORE across
     # variants) from being load-bearing. HF models have no checkpoint dir, so skip.
+    # Merge into any existing record so modes evaluated in separate runs accumulate (e.g. a
+    # bpb-only run followed by a core-only run keeps both) and the idempotency guard above
+    # sees the union of completed modes.
     if ddp_rank == 0 and checkpoint_dir is not None:
         eval_dir = os.path.join(checkpoint_dir, "evaluation")
         os.makedirs(eval_dir, exist_ok=True)
-        eval_json_path = os.path.join(eval_dir, f"eval_{resolved_step:06d}.json")
-        eval_record = {
-            "model_tag": model_tag,
-            "step": resolved_step,
-            "checkpoint_path": os.path.join(checkpoint_dir, f"model_{resolved_step:06d}.pt"),
-            "eval_modes": sorted(eval_modes),
-            "seeds": seeds,
-        }
+        eval_json_path = _eval_json_path(checkpoint_dir, resolved_step)
+        eval_record = _load_existing_eval(checkpoint_dir, resolved_step) or {}
+        eval_record["model_tag"] = model_tag
+        eval_record["step"] = resolved_step
+        eval_record["checkpoint_path"] = os.path.join(checkpoint_dir, f"model_{resolved_step:06d}.pt")
+        eval_record["eval_modes"] = sorted(set(eval_record.get("eval_modes", [])) | eval_modes)
         if 'bpb' in eval_modes:
             eval_record["bpb"] = bpb_results
             eval_record["val_bpb"] = bpb_results.get("val")
@@ -402,6 +453,8 @@ def main():
                 "per_seed": {str(r["seed"]): r["core_metric"] for r in core_per_seed},
                 "centered_results": core_results["centered_results"],
             }
+            eval_record["seeds"] = seeds          # seeds backing the CORE result
+        eval_record.setdefault("seeds", seeds)
         with open(eval_json_path, 'w', encoding='utf-8') as f:
             json.dump(eval_record, f, indent=2)
         print0(f"Canonical eval JSON written to: {eval_json_path}")
