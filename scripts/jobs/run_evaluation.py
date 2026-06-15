@@ -22,6 +22,8 @@ from typing import List
 
 
 EVAL_MODES = ("core", "bpb", "sample")
+# Modes that persist a per-metric result file ('sample' is stdout-only).
+PERSISTENT_EVAL_MODES = {"core", "bpb"}
 
 
 def _find_model_tags(base_checkpoints_dir: Path, model_filter: str = None) -> List[str]:
@@ -54,30 +56,33 @@ def _find_last_step(checkpoint_dir: Path) -> int:
 def _has_eval_results(checkpoint_dir: Path, step: int, eval_modes: set, seeds: List[int]) -> bool:
     """Check if evaluation results already exist for the given step and seeds.
 
-    The canonical per-checkpoint file is evaluation/eval_{step:06d}.json (written by
-    base_eval.py). To avoid skipping on stale/partial results we require: the file exists,
-    it covers every requested eval mode, and (when CORE is requested) it covers every
-    requested seed. This is also what prevents a shared/step-only artifact from being
-    mistaken for a per-variant result.
+    Each metric is written to its own per-(model_tag, step) file by base_eval.py:
+    evaluation/<mode>_{step:06d}.json (e.g. bpb_010000.json, core_010000.json). To avoid
+    skipping on stale/partial results we require every requested persistent mode (core/bpb)
+    to have its file and, when CORE is requested, that file to cover every requested seed.
+    'sample' produces no file, so it is ignored. Per-tag files prevent a shared/step-only
+    artifact from being mistaken for a per-variant result.
     """
     eval_dir = checkpoint_dir / "evaluation"
     if not eval_dir.is_dir():
         return False
-    results_file = eval_dir / f"eval_{step:06d}.json"
-    if not results_file.exists():
-        return False
-    try:
-        with open(results_file) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return False
-    if not all(mode in data for mode in eval_modes):
-        return False
-    # When CORE is requested, require all requested seeds to be present.
-    if "core" in eval_modes:
-        done_seeds = set(str(s) for s in data.get("seeds", []))
-        if not all(str(s) in done_seeds for s in seeds):
+    required = {m for m in eval_modes if m in PERSISTENT_EVAL_MODES}
+    if not required:
+        return False  # e.g. a sample-only request: nothing persistent to reuse
+    for mode in required:
+        results_file = eval_dir / f"{mode}_{step:06d}.json"
+        if not results_file.exists():
             return False
+        try:
+            with open(results_file) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return False
+        # When CORE is requested, require all requested seeds to be present.
+        if mode == "core":
+            done_seeds = set(str(s) for s in data.get("seeds", []))
+            if not all(str(s) in done_seeds for s in seeds):
+                return False
     return True
 
 

@@ -202,19 +202,22 @@ def _summarize(values):
 
 
 # -----------------------------------------------------------------------------
-# Idempotency: per-checkpoint eval results live in <checkpoint_dir>/evaluation/eval_<step>.json
+# Idempotency: each metric is persisted to its OWN file under <checkpoint_dir>/evaluation/
+# as <mode>_<step>.json (e.g. bpb_010000.json, core_010000.json). Keeping metrics in
+# separate files means a run of one mode can never overwrite or conflict with another's
+# result, and each mode's completeness is checked independently.
 
-# Eval modes that persist a result into the eval JSON ('sample' is stdout-only).
+# Eval modes that persist a result file ('sample' is stdout-only).
 PERSISTENT_EVAL_MODES = {"core", "bpb"}
 
 
-def _eval_json_path(checkpoint_dir, step):
-    return os.path.join(checkpoint_dir, "evaluation", f"eval_{step:06d}.json")
+def _metric_json_path(checkpoint_dir, mode, step):
+    return os.path.join(checkpoint_dir, "evaluation", f"{mode}_{step:06d}.json")
 
 
-def _load_existing_eval(checkpoint_dir, step):
-    """Return the parsed per-checkpoint eval record, or None if absent/unreadable."""
-    path = _eval_json_path(checkpoint_dir, step)
+def _load_metric(checkpoint_dir, mode, step):
+    """Return the parsed per-metric record for (mode, step), or None if absent/unreadable."""
+    path = _metric_json_path(checkpoint_dir, mode, step)
     if not os.path.exists(path):
         return None
     try:
@@ -224,23 +227,25 @@ def _load_existing_eval(checkpoint_dir, step):
         return None
 
 
-def _eval_already_complete(checkpoint_dir, step, eval_modes, seeds):
-    """True iff the saved eval record already covers every requested persistent mode
-    (core/bpb) and, for CORE, every requested seed. 'sample' writes no artifact, so it
-    never counts toward (nor blocks) completeness."""
-    data = _load_existing_eval(checkpoint_dir, step)
+def _mode_complete(checkpoint_dir, mode, step, seeds):
+    """True iff the per-metric file for ``mode`` exists and (for CORE) covers all seeds."""
+    data = _load_metric(checkpoint_dir, mode, step)
     if data is None:
         return False
+    if mode == "core":
+        done_seeds = {str(s) for s in data.get("seeds", [])}
+        return all(str(s) in done_seeds for s in seeds)
+    return True
+
+
+def _eval_already_complete(checkpoint_dir, step, eval_modes, seeds):
+    """True iff every requested persistent mode (core/bpb) already has its own result file
+    for this checkpoint and, for CORE, every requested seed. 'sample' writes no artifact, so
+    it never counts toward (nor blocks) completeness."""
     required = {m for m in eval_modes if m in PERSISTENT_EVAL_MODES}
     if not required:
         return False  # e.g. a sample-only request: nothing persistent to reuse
-    if not all(m in data for m in required):
-        return False
-    if "core" in required:
-        done_seeds = {str(s) for s in data.get("seeds", [])}
-        if not all(str(s) in done_seeds for s in seeds):
-            return False
-    return True
+    return all(_mode_complete(checkpoint_dir, m, step, seeds) for m in required)
 
 
 # -----------------------------------------------------------------------------
@@ -421,43 +426,51 @@ def main():
                 f.write(f"{'CORE':<35}, {'':<10}, {core_mean:<10.6f}\n")
             print0(f"\nResults written to: {output_csv_path}")
 
-    # --- Write canonical per-checkpoint evaluation JSON ---
-    # results.py / run_evaluation.py read this file, keyed by (model_tag, step). Writing it
-    # here is what stops the step-only CSV fallback (the source of identical CORE across
-    # variants) from being load-bearing. HF models have no checkpoint dir, so skip.
-    # Merge into any existing record so modes evaluated in separate runs accumulate (e.g. a
-    # bpb-only run followed by a core-only run keeps both) and the idempotency guard above
-    # sees the union of completed modes.
+    # --- Write per-metric evaluation JSON (one file per metric) ---
+    # results.py / run_evaluation.py read these per-(model_tag, step) files. Each metric is
+    # written to its OWN file (bpb_<step>.json, core_<step>.json) so a run of one mode can
+    # never overwrite or conflict with another mode's result. These files are also what stop
+    # the step-only CSV fallback (the source of identical CORE across variants) from being
+    # load-bearing. HF models have no checkpoint dir, so skip.
     if ddp_rank == 0 and checkpoint_dir is not None:
         eval_dir = os.path.join(checkpoint_dir, "evaluation")
         os.makedirs(eval_dir, exist_ok=True)
-        eval_json_path = _eval_json_path(checkpoint_dir, resolved_step)
-        eval_record = _load_existing_eval(checkpoint_dir, resolved_step) or {}
-        eval_record["model_tag"] = model_tag
-        eval_record["step"] = resolved_step
-        eval_record["checkpoint_path"] = os.path.join(checkpoint_dir, f"model_{resolved_step:06d}.pt")
-        eval_record["eval_modes"] = sorted(set(eval_record.get("eval_modes", [])) | eval_modes)
+        common = {
+            "model_tag": model_tag,
+            "step": resolved_step,
+            "checkpoint_path": os.path.join(checkpoint_dir, f"model_{resolved_step:06d}.pt"),
+        }
         if 'bpb' in eval_modes:
-            eval_record["bpb"] = bpb_results
-            eval_record["val_bpb"] = bpb_results.get("val")
-            eval_record["loss"] = loss_results
-            eval_record["val_loss"] = loss_results.get("val")
+            bpb_record = {
+                **common,
+                "bpb": bpb_results,
+                "val_bpb": bpb_results.get("val"),
+                "loss": loss_results,
+                "val_loss": loss_results.get("val"),
+            }
+            bpb_path = _metric_json_path(checkpoint_dir, "bpb", resolved_step)
+            with open(bpb_path, 'w', encoding='utf-8') as f:
+                json.dump(bpb_record, f, indent=2)
+            print0(f"BPB eval JSON written to: {bpb_path}")
         if core_per_seed:
             core_metrics = [r["core_metric"] for r in core_per_seed]
             core_mean, core_std, n_seeds = _summarize(core_metrics)
-            eval_record["core"] = {
-                "core_metric": core_mean,        # headline = mean across seeds
-                "core_metric_mean": core_mean,
-                "core_metric_std": core_std,
-                "num_seeds": n_seeds,
-                "per_seed": {str(r["seed"]): r["core_metric"] for r in core_per_seed},
-                "centered_results": core_results["centered_results"],
+            core_record = {
+                **common,
+                "seeds": seeds,                  # seeds backing the CORE result
+                "core": {
+                    "core_metric": core_mean,    # headline = mean across seeds
+                    "core_metric_mean": core_mean,
+                    "core_metric_std": core_std,
+                    "num_seeds": n_seeds,
+                    "per_seed": {str(r["seed"]): r["core_metric"] for r in core_per_seed},
+                    "centered_results": core_results["centered_results"],
+                },
             }
-            eval_record["seeds"] = seeds          # seeds backing the CORE result
-        eval_record.setdefault("seeds", seeds)
-        with open(eval_json_path, 'w', encoding='utf-8') as f:
-            json.dump(eval_record, f, indent=2)
-        print0(f"Canonical eval JSON written to: {eval_json_path}")
+            core_path = _metric_json_path(checkpoint_dir, "core", resolved_step)
+            with open(core_path, 'w', encoding='utf-8') as f:
+                json.dump(core_record, f, indent=2)
+            print0(f"CORE eval JSON written to: {core_path}")
 
     # --- Log to report ---
     from nanochat.report import get_report
