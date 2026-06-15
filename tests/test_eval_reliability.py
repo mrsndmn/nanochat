@@ -170,12 +170,13 @@ def test_distinct_variants_get_distinct_core(tmp_path):
 
     rows = results.collect_rows(tmp_path, model_filter=None)
     by_tag = {r[0]: r for r in rows}
-    # headers: model, step, val_bpb, CORE, CORE_std, n_layer, n_embd
-    assert by_tag["d12_baseline_aaaa"][3] == "0.0601"
-    assert by_tag["d12_proj_512_bbbb"][3] == "0.0644"
-    assert by_tag["d12_baseline_aaaa"][3] != by_tag["d12_proj_512_bbbb"][3]
+    # headers: model, step, val_bpb, val_nats, min_val_bpb, min_val_nats, CORE, CORE_std, n_layer, n_embd
+    # (CORE at idx 6 / CORE_std at idx 7 after the nats/min-val columns were added to results.py)
+    assert by_tag["d12_baseline_aaaa"][6] == "0.0601"
+    assert by_tag["d12_proj_512_bbbb"][6] == "0.0644"
+    assert by_tag["d12_baseline_aaaa"][6] != by_tag["d12_proj_512_bbbb"][6]
     # std column populated for multi-seed runs
-    assert by_tag["d12_proj_512_bbbb"][4] == "0.0009"
+    assert by_tag["d12_proj_512_bbbb"][7] == "0.0009"
 
 
 def test_core_csv_fallback_is_per_tag(tmp_path):
