@@ -55,6 +55,9 @@ parser.add_argument("--num-train-shards", type=int, default=-1, help="cap on num
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--embed-proj-dim", type=int, default=0, help="low-rank embedding projection dim (0=disabled). Adds low_dim_embed + Linear projection summed with wte")
 parser.add_argument("--unembed-proj-dim", type=int, default=0, help="low-rank unembedding correction dim (0=disabled). Adds a LoRA-style low-rank term to lm_head logits")
+# Sentence attention
+parser.add_argument("--gist-placement", type=str, default="none", choices=["none", "sentence_nltk", "uniform"], help="gist/end-of-sentence token insertion strategy (none=disabled; uniform reserved for follow-ups)")
+parser.add_argument("--num-gist-tokens", type=int, default=0, help="K gist tokens inserted per sentence boundary (0=disabled). Enables block-causal + global-gist sentence attention")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -138,7 +141,20 @@ else:
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
-vocab_size = tokenizer.get_vocab_size()
+real_vocab_size = tokenizer.get_vocab_size()
+
+# Sentence attention: reserve K gist token ids just past the real vocab, grow the model
+# vocab to cover them (the embedding/lm_head are sized to this), and extend token_bytes with
+# 0-byte entries for the gist ids (so bpb indexing never errors and gists are excluded from bpb).
+gist_token_ids_tuple = ()
+if args.gist_placement != "none" and args.num_gist_tokens > 0:
+    from nanochat.tokenizer import gist_token_ids as _gist_ids_fn
+    gist_token_ids_tuple = tuple(_gist_ids_fn(real_vocab_size, args.num_gist_tokens))
+    vocab_size = real_vocab_size + args.num_gist_tokens
+    token_bytes = torch.cat([token_bytes, torch.zeros(args.num_gist_tokens, dtype=token_bytes.dtype, device=token_bytes.device)], dim=0)
+    print0(f"Sentence attention: {args.num_gist_tokens} gist tokens (ids {gist_token_ids_tuple[0]}..{gist_token_ids_tuple[-1]}), placement={args.gist_placement}")
+else:
+    vocab_size = real_vocab_size
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -157,6 +173,9 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         embed_proj_dim=args.embed_proj_dim,
         unembed_proj_dim=args.unembed_proj_dim,
+        end_of_sentence_token_ids=gist_token_ids_tuple,
+        full_attention_layers=(),
+        bos_token_id=(tokenizer.get_bos_token_id() if gist_token_ids_tuple else -1),
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -366,8 +385,8 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, num_train_shards=args.num_train_shards)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, num_train_shards=args.num_train_shards, gist_token_ids=gist_token_ids_tuple, gist_placement=args.gist_placement)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, gist_token_ids=gist_token_ids_tuple, gist_placement=args.gist_placement)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -431,6 +450,8 @@ if not resuming:
     step = 0
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
+    val_loss = None # nats/token over real tokens (fair metric under supervise-everything)
+    min_val_loss = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
 else:
@@ -438,6 +459,9 @@ else:
     loop_state = meta_data["loop_state"]
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
+    # .get() so checkpoints written before these keys existed resume cleanly (no KeyError)
+    val_loss = meta_data.get("val_loss")
+    min_val_loss = loop_state.get("min_val_loss", float("inf"))
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
@@ -472,6 +496,7 @@ while True:
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # bpb from the most recent completed eval
+                "val_loss": val_loss, # nats/token over real tokens from the most recent completed eval (fair metric)
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
@@ -480,6 +505,7 @@ while True:
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
+                    "min_val_loss": min_val_loss,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
                 },
@@ -493,15 +519,20 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+            val_stats = evaluate_bpb(model, val_loader, eval_steps, token_bytes, return_stats=True)
+        val_bpb = val_stats["bpb"]      # stays a float (existing format/compare/save sites unchanged)
+        val_loss = val_stats["loss"]    # nats/token over real tokens (fair cross-arm metric)
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f} | loss: {val_loss:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
+        if val_loss < min_val_loss:
+            min_val_loss = val_loss
         run_logger.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
+            "val/loss": val_loss,
         })
         model.train()
 

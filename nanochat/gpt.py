@@ -44,6 +44,16 @@ class GPTConfig:
     # 0 = disabled. When > 0, adds unembed_proj_down (n_embd → r) + unembed_proj_up (r → vocab),
     # zero-initialized on the up side so the correction starts at zero.
     unembed_proj_dim: int = 0
+    # Sentence attention: gist ("end-of-sentence") token ids. Non-empty => sentence attention
+    # is active (block-causal + global-gist mask, confined per-document). Empty => standard
+    # causal attention (the model is bit-for-bit unchanged on this path).
+    end_of_sentence_token_ids: tuple[int, ...] = ()
+    # Layers that bypass the sentence mask and use plain full-causal attention. Empty here
+    # (pure sentence attention); kept for completeness / future use.
+    full_attention_layers: tuple[int, ...] = ()
+    # BOS token id: marked always-visible and used as the per-document segment delimiter for
+    # the sentence mask (segment id = cumulative count of BOS tokens). -1 disables BOS handling.
+    bos_token_id: int = -1
 
 
 def norm(x):
@@ -69,6 +79,23 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+
+def _closest_boundary_idx(gist_mask):
+    """For each query position, the index of the most recent sentence boundary strictly
+    before it. A boundary is the LAST token of each contiguous run of gist tokens.
+    Vectorized cummax trick (ported from the reference). gist_mask: (B, T) bool over gist ids.
+    Returns (B, T) long."""
+    B, T = gist_mask.shape
+    nxt = torch.zeros_like(gist_mask)
+    nxt[:, :-1] = gist_mask[:, 1:]
+    at_boundary = gist_mask & ~nxt                                  # last token of each gist run
+    pos = torch.arange(T, device=gist_mask.device).unsqueeze(0).expand(B, -1)
+    bidx = torch.where(at_boundary, pos, torch.zeros_like(pos))
+    last_incl, _ = torch.cummax(bidx, dim=1)                        # most recent boundary <= q
+    last_prev = torch.roll(last_incl, 1, dims=1)                    # shift to "strictly before q"
+    last_prev[:, 0] = 0
+    return last_prev.long()
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -86,7 +113,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, attn_mask=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -111,8 +138,18 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            if attn_mask is None:
+                # Training: causal attention with optional sliding window (unchanged baseline path)
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            else:
+                # Sentence attention: a custom boolean [B,1,T,T] mask (True = attend). FA3 cannot
+                # consume an arbitrary mask, so route through SDPA explicitly. q,k are already
+                # RoPE'd, QK-normed and pre-scaled by 1.2, so SDPA's default 1/sqrt(head_dim)
+                # softmax scale matches the FA3 path exactly.
+                qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B, H, T, D)
+                enable_gqa = qh.size(1) != kh.size(1)
+                y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=attn_mask, enable_gqa=enable_gqa)
+                y = y.transpose(1, 2)  # back to (B, T, H, D)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -152,8 +189,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, attn_mask=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, attn_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -359,6 +396,38 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def _build_sentence_mask(self, idx):
+        """Build the boolean [B, 1, T, T] sentence-attention mask (True = attend) for a full
+        sequence (training / no-kv-cache forward). Only called when sentence attention is active.
+
+        allowed = (block_causal | special_visible) & same_doc, with the diagonal forced True.
+        - block_causal:    causal AND k >= closest_boundary(q)  -> the query's own sentence block
+        - special_visible: causal AND key is a gist or BOS      -> earlier gists/BOS always visible
+        - same_doc:        query and key share a document (segment id = cumulative BOS count),
+                           so packed multi-doc rows never leak attention across document boundaries
+        """
+        B, T = idx.shape
+        device = idx.device
+        eos_ids = torch.tensor(self.config.end_of_sentence_token_ids, device=device)
+        gist_mask = (idx.unsqueeze(-1) == eos_ids).any(-1)              # (B, T) gist ids only
+        bos = self.config.bos_token_id
+        special_mask = gist_mask.clone()
+        if bos >= 0:
+            special_mask |= (idx == bos)                                # BOS always-visible
+        eos_idx = _closest_boundary_idx(gist_mask).unsqueeze(-1)        # (B, T, 1)
+        q = torch.arange(T, device=device).view(1, T, 1)
+        k = torch.arange(T, device=device).view(1, 1, T)
+        causal = k <= q                                                 # (1, T, T)
+        block_causal = causal & (k >= eos_idx)                          # (B, T, T)
+        special_visible = causal & special_mask.view(B, 1, T)          # (B, T, T)
+        allowed = block_causal | special_visible
+        if bos >= 0:
+            seg = (idx == bos).cumsum(dim=1)                            # (B, T) document id within row
+            same_doc = seg.unsqueeze(2) == seg.unsqueeze(1)           # (B, T, T)
+            allowed = allowed & same_doc                               # confine attention per-document
+        allowed = allowed | torch.eye(T, dtype=torch.bool, device=device).view(1, T, T)  # self always
+        return allowed.unsqueeze(1)                                     # (B, 1, T, T) bool
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -523,6 +592,13 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
+        # Sentence attention: build the block-causal + global-gist mask from the input ids.
+        # Only for full-sequence (no kv-cache) forward and only when gist tokens are configured;
+        # otherwise attn_mask stays None and the standard causal flash path is used unchanged.
+        attn_mask = None
+        if kv_cache is None and self.config.end_of_sentence_token_ids:
+            attn_mask = self._build_sentence_mask(idx)
+
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
@@ -531,7 +607,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, attn_mask)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

@@ -87,7 +87,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000, num_train_shards=-1
+    buffer_size=1000, num_train_shards=-1,
+    gist_token_ids=(), gist_placement="none",
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -116,9 +117,31 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
-        for tokens in token_lists:
-            doc_buffer.append(tokens)
+        if gist_placement == "none" or not gist_token_ids:
+            # BASELINE PATH — byte-for-byte identical to the original (no gist tokens).
+            token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+            for tokens in token_lists:
+                doc_buffer.append(tokens)
+            return
+        # SENTENCE-ATTENTION PATH: split each doc into NLTK sentences, batch-encode all
+        # sentences in one call (preserves tiktoken throughput), then stitch per-doc with K
+        # gist ids inserted after each sentence boundary EXCEPT the last. Every doc still
+        # starts with exactly one BOS (so the model's per-doc segmentation via BOS holds).
+        from nanochat.tokenizer import split_sentences_nltk
+        per_doc_sentences = [split_sentences_nltk(doc) for doc in doc_batch]
+        flat = [s for sents in per_doc_sentences for s in sents]
+        flat_ids = tokenizer.encode(flat, prepend=None, num_threads=tokenizer_threads) if flat else []
+        gist = list(gist_token_ids)
+        cursor = 0
+        for sents in per_doc_sentences:
+            n = len(sents)
+            doc_ids = [bos_token]
+            for j in range(n):
+                doc_ids.extend(flat_ids[cursor + j])
+                if j != n - 1:  # insert gist tokens between sentences, not after the last
+                    doc_ids.extend(gist)
+            cursor += n
+            doc_buffer.append(doc_ids)
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer

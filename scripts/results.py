@@ -123,6 +123,7 @@ def collect_rows(artifacts_root: Path, model_filter: str | None) -> list[list[st
 
         cfg = meta.get("model_config", {})
         user_cfg = meta.get("user_config", {})
+        loop_state = meta.get("loop_state", {}) or {}
         core_stats = _read_core_from_json(model_dir, step)
         if core_stats is None:
             core_stats = _read_core_from_csv(artifacts_root, model_tag, step)
@@ -135,6 +136,9 @@ def collect_rows(artifacts_root: Path, model_filter: str | None) -> list[list[st
             model_tag,
             str(step),
             _fmt(meta.get("val_bpb")),
+            _fmt(meta.get("val_loss")),            # nats/token (final step); fair under supervise-everything
+            _fmt(loop_state.get("min_val_bpb")),   # best in-training bpb (decision metric under overfit)
+            _fmt(loop_state.get("min_val_loss")),  # best in-training nats/token (primary decision metric)
             _fmt(core_mean),
             _fmt(core_std) if core_std else "",
             str(cfg.get("n_layer", user_cfg.get("depth", ""))),
@@ -173,7 +177,7 @@ def main() -> None:
         print("No checkpoints found.", flush=True)
         return
 
-    headers = ["model", "step", "val_bpb", "CORE", "CORE_std", "n_layer", "n_embd"]
+    headers = ["model", "step", "val_bpb", "val_nats", "min_val_bpb", "min_val_nats", "CORE", "CORE_std", "n_layer", "n_embd"]
     print(
         tabulate(rows, headers=headers, tablefmt=args.tablefmt, disable_numparse=True),
         flush=True,

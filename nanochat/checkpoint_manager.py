@@ -26,6 +26,15 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Sentence-attention keys (absent in pre-sentence-attention checkpoints). Defaults make
+    # those models behave exactly as before (no gist tokens => standard causal attention).
+    model_config_kwargs.setdefault("end_of_sentence_token_ids", ())
+    model_config_kwargs.setdefault("full_attention_layers", ())
+    model_config_kwargs.setdefault("bos_token_id", -1)
+    # JSON round-trips tuples to lists; coerce back so the config holds tuples as declared.
+    for _k in ("end_of_sentence_token_ids", "full_attention_layers"):
+        if model_config_kwargs.get(_k) is not None:
+            model_config_kwargs[_k] = tuple(model_config_kwargs[_k])
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -110,8 +119,14 @@ def build_model(checkpoint_dir, step, device, phase):
         model.train()
     # Load the Tokenizer
     tokenizer = get_tokenizer()
-    # Sanity check: compatibility between model and tokenizer
-    assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
+    # Sanity check: compatibility between model and tokenizer. Sentence-attention models grow
+    # the vocab by K gist tokens (ids past the real vocab, never emitted by the BPE), so the
+    # config vocab may legitimately be real_vocab + K.
+    real_vocab = tokenizer.get_vocab_size()
+    cfg_vocab = model_config_kwargs["vocab_size"]
+    n_gist = len(model_config_kwargs.get("end_of_sentence_token_ids", ()) or ())
+    assert cfg_vocab in (real_vocab, real_vocab + n_gist), \
+        f"vocab mismatch: config={cfg_vocab} tokenizer={real_vocab} gist_tokens={n_gist}"
     return model, tokenizer, meta_data
 
 
