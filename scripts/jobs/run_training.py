@@ -122,10 +122,21 @@ def linear_projection_embeddings_10k_experiments() -> list[dict]:
 
     # Longer training horizon: 10k explicit optimization steps. Identical across all arms so
     # the only varying factor is the embedding projection dimension.
+    #
+    # Intermediate (in-training-loop) evaluation is fully disabled: --eval-every (val bpb),
+    # --core-metric-every (CORE) and --sample-every (in-loop sampling) are all set to -1 so
+    # base_train.py runs no periodic eval/sampling during the run — evaluation happens ONLY
+    # after training, via the separate stage (scripts/jobs/run_evaluation.py ->
+    # scripts/base_eval.py), which computes CORE + BPB on the saved end-of-run checkpoint.
+    # The final checkpoint save is independent of these flags, so disabling them costs no
+    # final metrics; it only removes the periodic mid-run evals.
     shared_args = [
         f"--depth {depth}",
         "--window-pattern SSSL",
         "--num-iterations 10000",
+        "--eval-every -1",
+        "--core-metric-every -1",
+        "--sample-every -1",
     ]
 
     # Arms; the tag encodes proj dim explicitly (baseline = no projection).

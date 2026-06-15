@@ -86,6 +86,17 @@ def test_only_varying_factor_is_projection_dim():
     assert len(stripped) == 1, f"arms differ beyond projection dim: {stripped}"
 
 
+def test_intermediate_evaluation_disabled():
+    # Every arm disables in-training-loop eval so evaluation runs ONLY at the end of the run
+    # (final CORE + BPB are produced by the separate run_evaluation.py / base_eval.py stage).
+    # base_train.py treats -1 as "disable" for each periodic hook.
+    configs = linear_projection_embeddings_10k_experiments()
+    for c in configs:
+        assert "--eval-every -1" in c["args"], f"val-bpb eval not disabled: {c['args']}"
+        assert "--core-metric-every -1" in c["args"], f"CORE eval not disabled: {c['args']}"
+        assert "--sample-every -1" in c["args"], f"in-loop sampling not disabled: {c['args']}"
+
+
 def test_distinct_slug():
     configs = linear_projection_embeddings_10k_experiments()
     for c in configs:
