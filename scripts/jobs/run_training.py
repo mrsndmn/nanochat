@@ -154,9 +154,13 @@ def sentence_attention_experiments() -> list[dict]:
     full-causal baseline, at d12 / 10k steps / single seed.
 
     All arms use --window-pattern L so the comparison isolates the sentence mechanism rather
-    than confounding it with nanochat's default sliding-window pattern. Primary metric is val
-    nats/token over real tokens at the in-training minimum (gists are excluded from bpb/nats),
-    secondary min_val_bpb; CORE is reference-only (CORE prompts carry no gists). See
+    than confounding it with nanochat's default sliding-window pattern.
+
+    Evaluation protocol (reviewer-mandated): NO intermediate evaluation runs during training.
+    --eval-every / --core-metric-every / --sample-every are all set to -1, so the 10k steps
+    run uninterrupted and the model is scored ONLY at the end, by the separate post-training
+    evaluation stage (run_evaluation.py -> base_eval.py) on CORE + BPB of the final checkpoint.
+    Gists are excluded from bpb/nats; CORE is reference-only (CORE prompts carry no gists). See
     experiments/sentence-attention.md for the hypothesis, decision rule, and known threats.
     """
     experiment_slug = "sentence-attention"
@@ -169,6 +173,11 @@ def sentence_attention_experiments() -> list[dict]:
         f"--depth {depth}",
         "--window-pattern L",
         "--num-iterations 10000",
+        # Reviewer-mandated: disable ALL in-training evaluation/sampling. Evaluation is deferred
+        # entirely to the post-training stage so the run is never slowed or interrupted mid-train.
+        "--eval-every -1",
+        "--core-metric-every -1",
+        "--sample-every -1",
     ]
 
     # (tag, description, extra args). Baseline = full causal, no gists.
