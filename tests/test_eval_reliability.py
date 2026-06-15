@@ -226,6 +226,55 @@ def test_has_eval_results_missing_file(tmp_path):
     assert run_eval._has_eval_results(ckpt, 2520, {"core", "bpb"}, [1337]) is False
 
 
+# =============================================================================
+# base_eval._eval_already_complete: the eval SCRIPT's own idempotency guard
+# =============================================================================
+def _write_base_eval_json(tmp_path, step, modes, seeds):
+    """Write a per-checkpoint eval JSON the way base_eval would, as a string path."""
+    import scripts.base_eval as base_eval
+    ckpt = str(tmp_path / "d12_x")
+    evald = tmp_path / "d12_x" / "evaluation"
+    evald.mkdir(parents=True, exist_ok=True)
+    data = {"seeds": seeds}
+    for m in modes:
+        data[m] = {} if m == "core" else {"val": 1.0}
+    (evald / f"eval_{step:06d}.json").write_text(json.dumps(data))
+    return ckpt
+
+
+def test_eval_already_complete_all_modes_and_seeds(tmp_path):
+    import scripts.base_eval as base_eval
+    ckpt = _write_base_eval_json(tmp_path, 2520, modes=["core", "bpb"], seeds=[1337])
+    assert base_eval._eval_already_complete(ckpt, 2520, {"core", "bpb"}, [1337]) is True
+    # Missing seed must force a re-run.
+    assert base_eval._eval_already_complete(ckpt, 2520, {"core", "bpb"}, [1337, 2024]) is False
+
+
+def test_eval_already_complete_requires_all_modes(tmp_path):
+    import scripts.base_eval as base_eval
+    ckpt = _write_base_eval_json(tmp_path, 2520, modes=["bpb"], seeds=[1337])
+    assert base_eval._eval_already_complete(ckpt, 2520, {"core", "bpb"}, [1337]) is False
+    assert base_eval._eval_already_complete(ckpt, 2520, {"bpb"}, [1337]) is True
+
+
+def test_eval_already_complete_sample_is_ignored(tmp_path):
+    """'sample' has no persistent artifact, so it neither blocks completeness nor makes a
+    sample-only request skippable (unlike the launcher, which treats every mode strictly)."""
+    import scripts.base_eval as base_eval
+    ckpt = _write_base_eval_json(tmp_path, 2520, modes=["core", "bpb"], seeds=[1337])
+    # core+bpb done -> adding 'sample' to the request still counts as complete.
+    assert base_eval._eval_already_complete(ckpt, 2520, {"core", "bpb", "sample"}, [1337]) is True
+    # A sample-only request is never skippable (nothing persistent to reuse).
+    assert base_eval._eval_already_complete(ckpt, 2520, {"sample"}, [1337]) is False
+
+
+def test_eval_already_complete_missing_file(tmp_path):
+    import scripts.base_eval as base_eval
+    ckpt = str(tmp_path / "no_evaluation")
+    (tmp_path / "no_evaluation").mkdir()
+    assert base_eval._eval_already_complete(ckpt, 2520, {"core", "bpb"}, [1337]) is False
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
