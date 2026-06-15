@@ -6,6 +6,7 @@ import re
 import glob
 import json
 import logging
+import dataclasses
 import torch
 
 from nanochat.common import get_base_dir
@@ -21,11 +22,26 @@ def log0(message):
         logger.info(message)
 
 def _patch_missing_config_keys(model_config_kwargs):
-    """Add default values for new config keys missing in old checkpoints."""
+    """Normalize a saved model config so it can construct the current GPTConfig.
+
+    Handles version skew between the code that saved a checkpoint and the code
+    loading it:
+    - adds defaults for keys this version expects but the checkpoint lacks, and
+    - drops keys the checkpoint carries but this version's GPTConfig no longer
+      accepts (e.g. fields from a sibling experiment branch that shares the
+      base_checkpoints dir). Constructing GPTConfig(**kwargs) with unknown keys
+      raises TypeError, so they are filtered out here; any genuine architectural
+      mismatch is still caught later by the strict state_dict load.
+    """
     # Old models were trained with full context (no sliding window)
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Drop keys not supported by the current GPTConfig (forward-compat).
+    valid_fields = {f.name for f in dataclasses.fields(GPTConfig)}
+    for key in [k for k in model_config_kwargs if k not in valid_fields]:
+        dropped = model_config_kwargs.pop(key)
+        log0(f"Dropping unknown model config key '{key}'={dropped!r} not supported by current GPTConfig")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

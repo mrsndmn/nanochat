@@ -51,6 +51,19 @@ def _find_last_step(checkpoint_dir: Path) -> int:
     return max(steps) if steps else -1
 
 
+def _read_model_vocab_size(checkpoint_dir: Path, step: int):
+    """Read model_config.vocab_size from a checkpoint's meta_<step>.json (or None)."""
+    meta_file = checkpoint_dir / f"meta_{step:06d}.json"
+    if not meta_file.exists():
+        return None
+    try:
+        with open(meta_file) as f:
+            data = json.load(f)
+        return data.get("model_config", {}).get("vocab_size")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def _has_eval_results(checkpoint_dir: Path, step: int, eval_modes: set, seeds: List[int]) -> bool:
     """Check if evaluation results already exist for the given step and seeds.
 
@@ -181,6 +194,21 @@ if __name__ == "__main__":
     _log(f"Found {len(model_tags)} model(s) to evaluate: {', '.join(model_tags)}", output_json)
     _log(f"Eval seeds: {seeds}", output_json)
 
+    # Determine the current tokenizer vocab size so we can skip checkpoints whose
+    # vocab is incompatible with this harness. Foreign checkpoints from sibling
+    # experiments (e.g. a custom-tokenizer "sa_nltk" run with vocab 32769) can land
+    # in the shared base_checkpoints dir; base_eval asserts tokenizer vocab == model
+    # vocab, so launching jobs for them only wastes resources and fails the stage.
+    tokenizer_vocab_size = None
+    try:
+        os.environ.setdefault("NANOCHAT_BASE_DIR", base_dir_local)
+        from nanochat.tokenizer import get_tokenizer
+        tokenizer_vocab_size = get_tokenizer().get_vocab_size()
+        _log(f"Tokenizer vocab size: {tokenizer_vocab_size}", output_json)
+    except Exception as e:  # noqa: BLE001 - tokenizer optional; only used to skip incompatible ckpts
+        _log(f"\033[33mCould not load tokenizer to check vocab compatibility ({e}); "
+             f"skipping vocab guard\033[0m", output_json)
+
     # Sanity check: each model_tag must resolve to a DISTINCT checkpoint dir + latest step.
     # Identical (dir, step) across tags would mean variants share weights/results — the exact
     # failure mode behind the flat-CORE artifact. Log the resolved triples and warn on any
@@ -205,6 +233,16 @@ if __name__ == "__main__":
         if step < 0:
             _log(f"\033[33mSkipping {model_tag}: no model checkpoints found\033[0m", output_json)
             continue
+
+        # Skip checkpoints whose vocab is incompatible with the current tokenizer
+        # (foreign sibling-experiment checkpoints that base_eval cannot load).
+        if tokenizer_vocab_size is not None:
+            ckpt_vocab = _read_model_vocab_size(checkpoint_dir, step)
+            if ckpt_vocab is not None and ckpt_vocab != tokenizer_vocab_size:
+                _log(f"\033[33mSkipping {model_tag} step {step}: model vocab_size={ckpt_vocab} "
+                     f"!= tokenizer vocab_size={tokenizer_vocab_size} (incompatible checkpoint)\033[0m",
+                     output_json)
+                continue
 
         if _has_eval_results(checkpoint_dir, step, eval_modes, seeds) and not args.force:
             _log(f"\033[33mSkipping {model_tag} step {step}: eval results already exist\033[0m", output_json)
