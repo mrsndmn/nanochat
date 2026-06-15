@@ -236,6 +236,8 @@ def main():
     is_hf_model = args.hf_path is not None
     checkpoint_dir = None
     resolved_step = None
+    eval_gist_ids = ()
+    eval_gist_placement = "none"
     if is_hf_model:
         model, tokenizer = load_hf_model(args.hf_path, device)
         sequence_len = model.max_seq_len or 1024
@@ -247,6 +249,13 @@ def main():
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
+        # Sentence attention: reconstruct gist config from the checkpoint so the BPB val loader
+        # inserts the same gist tokens the model was trained with (the mask is derived in forward
+        # from the input ids), and extend token_bytes with 0-byte entries for the gist ids.
+        eval_gist_ids = tuple(meta["model_config"].get("end_of_sentence_token_ids", ()) or ())
+        eval_gist_placement = "sentence_nltk" if eval_gist_ids else "none"
+        if eval_gist_ids:
+            token_bytes = torch.cat([token_bytes, torch.zeros(len(eval_gist_ids), dtype=token_bytes.dtype, device=token_bytes.device)], dim=0)
         resolved_step = meta['step']
         # Resolve the model tag (auto-guessing the largest model when not given) and the
         # on-disk checkpoint path so they are logged explicitly. This catches the case where
@@ -329,7 +338,7 @@ def main():
         steps = args.split_tokens // tokens_per_step
 
         for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device, gist_token_ids=eval_gist_ids, gist_placement=eval_gist_placement)
             stats = evaluate_bpb(model, loader, steps, token_bytes, return_stats=True)
             bpb_results[split_name] = stats["bpb"]
             loss_results[split_name] = stats["loss"]
