@@ -171,11 +171,16 @@ if __name__ == "__main__":
     workdir = os.getcwd()
     workdir = workdir.replace('/mnt/virtual_ai0001053-00054_SR004-nfs2/', '/workspace-SR004.nfs2/')
 
-    # Persistent base dir holding the prepared tokenizer, training data and
-    # checkpoints. Worker containers resolve ~ to /home/user (no prepared data),
-    # so the job must be pointed at the workspace-mounted artifacts/ directory.
+    # Persistent base dir holding the prepared tokenizer, training data and checkpoints.
+    # The job's base dir is the worktree's `artifacts` symlink: nanochat.common
+    # (_ensure_worktree_artifacts_symlink) points it at the absolute shared store
+    # (SHARED_ARTIFACTS_DIR = /workspace-SR004.nfs2/d.tarasov/nanochat-artifacts), so the
+    # symlink is auto-created for new worktrees and resolves inside worker containers
+    # (which mount /workspace-SR004.nfs2, not /mnt/virtual_*). The local checkpoint-exists
+    # check reads the shared store directly (absolute) so it is correct even before the
+    # worktree symlink exists.
     base_dir_job = f"{workdir}/artifacts"
-    base_dir_local = os.path.join(os.getcwd(), "artifacts")
+    base_dir_local = "/workspace-SR004.nfs2/d.tarasov/nanochat-artifacts"
 
     python_path = sys.executable
     env_prefix = python_path.removesuffix("/python").replace('/home/jovyan/.mlspace/envs/', '/workspace-SR004.nfs2/d.tarasov/envs/')

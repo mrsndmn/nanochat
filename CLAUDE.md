@@ -44,8 +44,10 @@ python scripts/jobs/run_training.py --force
 
 ### Evaluation
 
-Discovers trained checkpoints under `$NANOCHAT_BASE_DIR/base_checkpoints/` (default
-`~/.cache/nanochat`), picks the latest step per model, and submits `base_eval.py` jobs.
+Discovers trained checkpoints under `$NANOCHAT_BASE_DIR/base_checkpoints/` (default is the
+shared artifacts store `nanochat.common.SHARED_ARTIFACTS_DIR`,
+`/workspace-SR004.nfs2/d.tarasov/nanochat-artifacts`), picks the latest step per model, and
+submits `base_eval.py` jobs.
 
 ```bash
 # Preview eval jobs

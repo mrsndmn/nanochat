@@ -14,10 +14,11 @@ fi
 echo "ENV_PREFIX=$ENV_PREFIX"
 echo "WORKDIR=$WORKDIR"
 
-# Point nanochat at the workspace-mounted artifacts/ dir (prepared tokenizer,
-# training data, checkpoints, eval bundle). The MPI launch does not reliably
-# forward the NANOCHAT_BASE_DIR env var from the job config to the worker
-# ranks, so derive it here from WORKDIR (which is forwarded) and export it.
+# Point nanochat at the worktree's artifacts/ dir (prepared tokenizer, training data,
+# checkpoints, eval bundle). nanochat.common resolves this to a symlink onto the absolute
+# shared store (SHARED_ARTIFACTS_DIR), auto-creating it for new worktrees and resolving it
+# inside worker containers. The MPI launch does not reliably forward NANOCHAT_BASE_DIR from
+# the job config to the worker ranks, so derive it here from WORKDIR (which is forwarded).
 # Any value that *was* forwarded takes precedence.
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$WORKDIR/artifacts}"
 echo "NANOCHAT_BASE_DIR=$NANOCHAT_BASE_DIR"
