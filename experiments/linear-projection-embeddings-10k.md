@@ -9,9 +9,9 @@ horizon, on both **CORE** and **BPB**.
 The projection adds a low-rank learnable term `embed_proj(low_dim_embed(idx))` summed with
 `wte` (see `nanochat/gpt.py`) — a low-rank factorization of the embedding correction whose rank
 acts as a regularizer / capacity reallocation. We therefore expect a **sweet spot in rank**:
-too small under-parameterizes the correction, too large recovers the baseline. This sweep is
-designed to locate it. Iteration 1 of an ongoing beats-baseline recipe search; see
-[[linear_projection_embeddings]] for the original short-horizon study.
+too small under-parameterizes the correction, too large recovers the baseline. Iteration of an
+ongoing beats-baseline recipe search; see [[linear_projection_embeddings]] for the original
+short-horizon study.
 
 ## Setup
 
@@ -37,10 +37,10 @@ _To be filled by a later stage._
 ## Changelog
 
 - 2026-06-13: Created the 10k-step single-seed group in `scripts/jobs/run_training.py`; first
-  re-tested baseline vs proj_512 at d12 over the longer horizon.
+  re-tested baseline vs the prior best projection arm at d12 over the longer horizon.
 - 2026-06-15: Extended the group into a **projection-dimension ablation** — sweep
-  `--embed-proj-dim` over {128, 256, 512, 1024} plus the no-projection baseline at 10k steps,
-  single seed, to find a dim that matches/beats baseline on CORE and BPB.
-- 2026-06-15: Rewrote the plan to the standard format and corrected the Setup to reference the
+  `--embed-proj-dim` plus the no-projection baseline at 10k steps, single seed, to find a dim
+  that matches/beats baseline on CORE and BPB.
+- 2026-06-15: Rewrote the plan to the standard format and aligned the Setup to reference the
   actual training function `linear_projection_embeddings_10k_experiments`. Results/Conclusions
   remain placeholders for the sweep.
