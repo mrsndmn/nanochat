@@ -8,8 +8,8 @@ latest training step and reports:
                     across eval seeds when multiple seeds were run
 - ``depth``/``n_embd`` — model size, for context
 
-CORE is read from the canonical per-(model_tag, step) eval JSON
-(``artifacts/base_checkpoints/<tag>/evaluation/eval_<step>.json``, written by
+CORE is read from the per-(model_tag, step) CORE file
+(``artifacts/base_checkpoints/<tag>/evaluation/core_<step>.json``, written by
 ``base_eval.py``) when present, otherwise from the per-(model_tag, step) CSV
 ``artifacts/base_eval/<tag>_<step>.csv``. Both are keyed by model_tag so distinct
 variants finishing at the same step never share a results file.
@@ -27,13 +27,13 @@ from tabulate import tabulate
 
 
 def _read_core_from_json(checkpoint_dir: Path, step: int) -> tuple[float, float | None, int] | None:
-    """Read CORE (mean, std, num_seeds) from the canonical evaluation JSON, if it exists.
+    """Read CORE (mean, std, num_seeds) from the per-metric CORE JSON, if it exists.
 
-    The JSON is written by base_eval.py per (model_tag, step), so it is never shared across
-    variants. ``core`` is a dict carrying the across-seed mean/std; older single-value forms
-    are still accepted for backward compatibility.
+    The file (evaluation/core_<step>.json) is written by base_eval.py per (model_tag, step),
+    so it is never shared across variants. ``core`` is a dict carrying the across-seed
+    mean/std; older single-value forms are still accepted for backward compatibility.
     """
-    eval_file = checkpoint_dir / "evaluation" / f"eval_{step:06d}.json"
+    eval_file = checkpoint_dir / "evaluation" / f"core_{step:06d}.json"
     if not eval_file.exists():
         return None
     try:

@@ -143,8 +143,8 @@ def _write_checkpoint(root, tag, step, val_bpb, core_dict=None, n_layer=12, n_em
     if core_dict is not None:
         evald = ckpt / "evaluation"
         evald.mkdir(exist_ok=True)
-        record = {"step": step, "bpb": {"val": val_bpb}, "core": core_dict}
-        (evald / f"eval_{step:06d}.json").write_text(json.dumps(record))
+        record = {"step": step, "core": core_dict}
+        (evald / f"core_{step:06d}.json").write_text(json.dumps(record))
     return ckpt
 
 
@@ -196,13 +196,18 @@ def test_core_csv_fallback_is_per_tag(tmp_path):
 # run_evaluation._has_eval_results: seed-aware skip logic
 # =============================================================================
 def _write_eval_json(tmp_path, step, modes, seeds):
+    """Write per-metric result files the way base_eval does (<mode>_<step>.json)."""
     ckpt = tmp_path / "d12_x"
     evald = ckpt / "evaluation"
     evald.mkdir(parents=True, exist_ok=True)
-    data = {"seeds": seeds}
     for m in modes:
-        data[m] = {} if m == "core" else {"val": 1.0}
-    (evald / f"eval_{step:06d}.json").write_text(json.dumps(data))
+        if m == "core":
+            record = {"step": step, "seeds": seeds, "core": {}}
+        elif m == "bpb":
+            record = {"step": step, "bpb": {"val": 1.0}}
+        else:
+            continue
+        (evald / f"{m}_{step:06d}.json").write_text(json.dumps(record))
     return ckpt
 
 
@@ -230,15 +235,18 @@ def test_has_eval_results_missing_file(tmp_path):
 # base_eval._eval_already_complete: the eval SCRIPT's own idempotency guard
 # =============================================================================
 def _write_base_eval_json(tmp_path, step, modes, seeds):
-    """Write a per-checkpoint eval JSON the way base_eval would, as a string path."""
-    import scripts.base_eval as base_eval
+    """Write per-metric result files the way base_eval does (<mode>_<step>.json)."""
     ckpt = str(tmp_path / "d12_x")
     evald = tmp_path / "d12_x" / "evaluation"
     evald.mkdir(parents=True, exist_ok=True)
-    data = {"seeds": seeds}
     for m in modes:
-        data[m] = {} if m == "core" else {"val": 1.0}
-    (evald / f"eval_{step:06d}.json").write_text(json.dumps(data))
+        if m == "core":
+            record = {"step": step, "seeds": seeds, "core": {}}
+        elif m == "bpb":
+            record = {"step": step, "bpb": {"val": 1.0}}
+        else:
+            continue
+        (evald / f"{m}_{step:06d}.json").write_text(json.dumps(record))
     return ckpt
 
 
