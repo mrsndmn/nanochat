@@ -456,6 +456,36 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
+    # save checkpoint FIRST, before any evaluation or sampling, so that a crash in any
+    # subsequent step (including the network-dependent CORE eval) cannot discard a
+    # completed training step. Saved at the end of the run, or every save_every steps,
+    # except at the first step or the resume step. Note: val_bpb here is from the most
+    # recent completed eval -- the val-bpb eval below runs after the save -- so it may
+    # lag by one eval interval (None until the first eval has run).
+    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            orig_model.state_dict(), # model parameters
+            optimizer.state_dict(), # optimizer state
+            { # metadata saved as json
+                "step": step,
+                "val_bpb": val_bpb, # bpb from the most recent completed eval
+                "model_config": model_config_kwargs,
+                "user_config": user_config, # inputs to the training script
+                "device_batch_size": args.device_batch_size,
+                "max_seq_len": args.max_seq_len,
+                "total_batch_size": total_batch_size,
+                "dataloader_state_dict": dataloader_state_dict,
+                "loop_state": { # all loop state (other than step) so that we can resume training
+                    "min_val_bpb": min_val_bpb,
+                    "smooth_train_loss": smooth_train_loss,
+                    "total_training_time": total_training_time,
+                },
+            },
+            rank=ddp_rank,
+        )
+
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
@@ -473,35 +503,6 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
-
-    # save checkpoint BEFORE the CORE-metric eval and sampling, so that a crash in a
-    # (possibly network-dependent) evaluation cannot discard a completed training step.
-    # Saved at the end of the run, or every save_every steps, except at the first step
-    # or the resume step. The val bpb above is local/cheap and runs first so the saved
-    # metadata records the val_bpb that matches these weights.
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
-                "total_batch_size": total_batch_size,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
-                },
-            },
-            rank=ddp_rank,
-        )
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
