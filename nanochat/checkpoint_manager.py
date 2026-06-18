@@ -103,6 +103,13 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
+    # Forward-compat across branches: drop any config keys this GPTConfig doesn't declare
+    # (e.g. an experiment-specific field maintained only on another branch). Warn for visibility.
+    import dataclasses as _dataclasses
+    _known_cfg_keys = {f.name for f in _dataclasses.fields(GPTConfig)}
+    for _k in [k for k in list(model_config_kwargs) if k not in _known_cfg_keys]:
+        log0(f"Dropping unknown model_config key '{_k}' (not in this GPTConfig)")
+        del model_config_kwargs[_k]
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)

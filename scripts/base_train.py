@@ -53,8 +53,6 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--num-train-shards", type=int, default=-1, help="cap on number of train shards used (-1 = all available). Pins the epoch/data budget so a run can be kept within a single epoch (no data repetition); val split always uses the last shard")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
-parser.add_argument("--embed-proj-dim", type=int, default=0, help="low-rank embedding projection dim (0=disabled). Adds low_dim_embed + Linear projection summed with wte")
-parser.add_argument("--unembed-proj-dim", type=int, default=0, help="low-rank unembedding correction dim (0=disabled). Adds a LoRA-style low-rank term to lm_head logits")
 # Sentence attention
 parser.add_argument("--gist-placement", type=str, default="none", choices=["none", "sentence_nltk", "uniform"], help="gist/end-of-sentence token insertion strategy (none=disabled; uniform reserved for follow-ups)")
 parser.add_argument("--num-gist-tokens", type=int, default=0, help="K gist tokens inserted per sentence boundary (0=disabled). Enables block-causal + global-gist sentence attention")
@@ -171,8 +169,6 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
-        embed_proj_dim=args.embed_proj_dim,
-        unembed_proj_dim=args.unembed_proj_dim,
         end_of_sentence_token_ids=gist_token_ids_tuple,
         full_attention_layers=(),
         bos_token_id=(tokenizer.get_bos_token_id() if gist_token_ids_tuple else -1),
@@ -182,8 +178,7 @@ def build_model_meta(depth):
     return model_meta
 
 # Seed all RNGs before model init + data loading so the run is reproducible and so that
-# distinct --seed values give genuinely different weight initializations (including the
-# zero-mean low_dim_embed projection init in GPT.init_weights). The same seed is applied on
+# distinct --seed values give genuinely different weight initializations. The same seed is applied on
 # every rank on purpose: init_weights runs independently per rank, so an identical seed is
 # what keeps the DDP replicas bit-identical at init. The bestfit dataloader is deterministic
 # (sequential parquet iteration, no shuffle, no RNG/workers), so weight init is the dominant

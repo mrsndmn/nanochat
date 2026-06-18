@@ -23,60 +23,6 @@ from typing import List
 # ---------------------------------------------------------------------------
 
 
-def linear_projection_embedding_experiments() -> list[dict]:
-    """Full-dataset single-epoch (<=1 epoch) 10k-step baseline-vs-proj_512 comparison.
-
-    Tests the linear-projection embed mechanism (`--embed-proj-dim 512` on the proj arm) at
-    d12 over a 10k-step horizon, with the data capped to <=1 epoch (no repetition). Two arms:
-    baseline (embed_proj_dim=0, the default) and proj512. Single seed only — one config per arm
-    (no multi-seed fan-out, per project convention).
-
-    Data budget: pin all 150 train shards so 10k steps at the (unchanged) 524,288 tok/step
-    global batch consume ~0.78 epoch and the loader never wraps. We deliberately do NOT pass
-    --device-batch-size / --max-seq-len / --total-batch-size, so the global/effective batch
-    size stays exactly as the prior d12 runs.
-    """
-    experiment_slug = "linear-projection-embeddings-10k-1ep"
-    num_gpus = 4
-    instance_type = "a100.4gpu"
-    depth = 12
-
-    # Single seed only — no multi-seed fan-out this phase.
-    seed = 0
-
-    num_train_shards = 150  # >= 118 required for >=1 epoch over 10k steps
-
-    shared_args = [
-        f"--depth {depth}",
-        "--window-pattern SSSL",
-        "--num-iterations 10000",
-        f"--num-train-shards {num_train_shards}",
-    ]
-
-    # Two arms; the tag encodes proj dim explicitly (baseline = no projection).
-    variants = [
-        ("baseline", "d12 baseline (no embed projection), 10k steps, full-dataset single-epoch", []),
-        ("proj512", "d12 embed_proj_dim=512, 10k steps, full-dataset single-epoch", ["--embed-proj-dim 512"]),
-    ]
-
-    configs = []
-    for tag, base_description, extra_args in variants:
-        args_parts = shared_args + extra_args + [f"--seed {seed}"]
-        args_str = " ".join(args_parts).strip()
-        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
-        model_tag = f"d{depth}_{tag}_10k_1ep"
-        configs.append({
-            "args": args_str,
-            "model_tag": model_tag,
-            "description": base_description,
-            "cmd_hash": cmd_hash,
-            "instance_type": instance_type,
-            "experiment_slug": experiment_slug,
-            "num_gpus": num_gpus,
-        })
-    return configs
-
-
 def sentence_attention_experiments() -> list[dict]:
     """Sentence attention: 1 full-causal baseline + 4 sentence-attention arms.
 
@@ -205,7 +151,6 @@ if __name__ == "__main__":
     # Aggregate all experiment configs
     # -----------------------------------------------------------------------
     experiment_configs = [
-        *linear_projection_embedding_experiments(),
         *sentence_attention_experiments(),
     ]
 
