@@ -26,15 +26,6 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
-    # Sentence-attention keys (absent in pre-sentence-attention checkpoints). Defaults make
-    # those models behave exactly as before (no gist tokens => standard causal attention).
-    model_config_kwargs.setdefault("end_of_sentence_token_ids", ())
-    model_config_kwargs.setdefault("full_attention_layers", ())
-    model_config_kwargs.setdefault("bos_token_id", -1)
-    # JSON round-trips tuples to lists; coerce back so the config holds tuples as declared.
-    for _k in ("end_of_sentence_token_ids", "full_attention_layers"):
-        if model_config_kwargs.get(_k) is not None:
-            model_config_kwargs[_k] = tuple(model_config_kwargs[_k])
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -103,6 +94,13 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
+    # Forward-compat across branches: drop any config keys this GPTConfig doesn't declare
+    # (e.g. an experiment-specific field maintained only on another branch). Warn for visibility.
+    import dataclasses as _dataclasses
+    _known_cfg_keys = {f.name for f in _dataclasses.fields(GPTConfig)}
+    for _k in [k for k in list(model_config_kwargs) if k not in _known_cfg_keys]:
+        log0(f"Dropping unknown model_config key '{_k}' (not in this GPTConfig)")
+        del model_config_kwargs[_k]
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)
@@ -119,14 +117,11 @@ def build_model(checkpoint_dir, step, device, phase):
         model.train()
     # Load the Tokenizer
     tokenizer = get_tokenizer()
-    # Sanity check: compatibility between model and tokenizer. Sentence-attention models grow
-    # the vocab by K gist tokens (ids past the real vocab, never emitted by the BPE), so the
-    # config vocab may legitimately be real_vocab + K.
+    # Sanity check: compatibility between model and tokenizer.
     real_vocab = tokenizer.get_vocab_size()
     cfg_vocab = model_config_kwargs["vocab_size"]
-    n_gist = len(model_config_kwargs.get("end_of_sentence_token_ids", ()) or ())
-    assert cfg_vocab in (real_vocab, real_vocab + n_gist), \
-        f"vocab mismatch: config={cfg_vocab} tokenizer={real_vocab} gist_tokens={n_gist}"
+    assert cfg_vocab == real_vocab, \
+        f"vocab mismatch: config={cfg_vocab} tokenizer={real_vocab}"
     return model, tokenizer, meta_data
 
 

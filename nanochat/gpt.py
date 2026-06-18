@@ -37,23 +37,6 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # Linear projection embedding: low-rank correction added to wte.
-    # 0 = disabled. When > 0, adds low_dim_embed (vocab × embed_proj_dim) + Linear (embed_proj_dim → n_embd).
-    embed_proj_dim: int = 0
-    # Low-rank unembedding correction: LoRA-style low-rank term added to lm_head logits.
-    # 0 = disabled. When > 0, adds unembed_proj_down (n_embd → r) + unembed_proj_up (r → vocab),
-    # zero-initialized on the up side so the correction starts at zero.
-    unembed_proj_dim: int = 0
-    # Sentence attention: gist ("end-of-sentence") token ids. Non-empty => sentence attention
-    # is active (block-causal + global-gist mask, confined per-document). Empty => standard
-    # causal attention (the model is bit-for-bit unchanged on this path).
-    end_of_sentence_token_ids: tuple[int, ...] = ()
-    # Layers that bypass the sentence mask and use plain full-causal attention. Empty here
-    # (pure sentence attention); kept for completeness / future use.
-    full_attention_layers: tuple[int, ...] = ()
-    # BOS token id: marked always-visible and used as the per-document segment delimiter for
-    # the sentence mask (segment id = cumulative count of BOS tokens). -1 disables BOS handling.
-    bos_token_id: int = -1
 
 
 def norm(x):
@@ -80,22 +63,6 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
-def _closest_boundary_idx(gist_mask):
-    """For each query position, the index of the most recent sentence boundary strictly
-    before it. A boundary is the LAST token of each contiguous run of gist tokens.
-    Vectorized cummax trick (ported from the reference). gist_mask: (B, T) bool over gist ids.
-    Returns (B, T) long."""
-    B, T = gist_mask.shape
-    nxt = torch.zeros_like(gist_mask)
-    nxt[:, :-1] = gist_mask[:, 1:]
-    at_boundary = gist_mask & ~nxt                                  # last token of each gist run
-    pos = torch.arange(T, device=gist_mask.device).unsqueeze(0).expand(B, -1)
-    bidx = torch.where(at_boundary, pos, torch.zeros_like(pos))
-    last_incl, _ = torch.cummax(bidx, dim=1)                        # most recent boundary <= q
-    last_prev = torch.roll(last_incl, 1, dims=1)                    # shift to "strictly before q"
-    last_prev[:, 0] = 0
-    return last_prev.long()
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -113,7 +80,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, attn_mask=None):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -138,18 +105,8 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            if attn_mask is None:
-                # Training: causal attention with optional sliding window (unchanged baseline path)
-                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-            else:
-                # Sentence attention: a custom boolean [B,1,T,T] mask (True = attend). FA3 cannot
-                # consume an arbitrary mask, so route through SDPA explicitly. q,k are already
-                # RoPE'd, QK-normed and pre-scaled by 1.2, so SDPA's default 1/sqrt(head_dim)
-                # softmax scale matches the FA3 path exactly.
-                qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B, H, T, D)
-                enable_gqa = qh.size(1) != kh.size(1)
-                y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=attn_mask, enable_gqa=enable_gqa)
-                y = y.transpose(1, 2)  # back to (B, T, H, D)
+            # Training: causal attention with optional sliding window
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -189,8 +146,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, attn_mask=None):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, attn_mask)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -228,22 +185,6 @@ class GPT(nn.Module):
         self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
-        # Linear projection embedding: low-rank learnable correction summed with wte
-        # inputs_embeds = Linear(low_dim_embed(token_ids)) + wte(token_ids)
-        if config.embed_proj_dim > 0:
-            self.low_dim_embed = nn.Embedding(padded_vocab_size, config.embed_proj_dim)
-            self.embed_proj = Linear(config.embed_proj_dim, config.n_embd, bias=False)
-        else:
-            self.low_dim_embed = None
-            self.embed_proj = None
-        # Low-rank unembedding correction: logits = lm_head(x) + unembed_proj_up(unembed_proj_down(x))
-        # Zero-init the up projection so the correction starts at zero (no change to lm_head at init).
-        if config.unembed_proj_dim > 0:
-            self.unembed_proj_down = Linear(config.n_embd, config.unembed_proj_dim, bias=False)
-            self.unembed_proj_up = Linear(config.unembed_proj_dim, padded_vocab_size, bias=False)
-        else:
-            self.unembed_proj_down = None
-            self.unembed_proj_up = None
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -310,19 +251,6 @@ class GPT(nn.Module):
         torch.nn.init.constant_(self.backout_lambda, 0.2)
         torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
-        # Linear projection embedding init
-        if self.low_dim_embed is not None:
-            torch.nn.init.normal_(self.low_dim_embed.weight, mean=0.0, std=0.8)
-            # Zero-init the projection so the correction starts at zero (no change to wte at init)
-            torch.nn.init.zeros_(self.embed_proj.weight)
-
-        # Low-rank unembedding correction init
-        if self.unembed_proj_down is not None:
-            # Down projection: matrix-like uniform init (same std as transformer matrices)
-            torch.nn.init.uniform_(self.unembed_proj_down.weight, -s, s)
-            # Zero-init the up projection so the correction starts at zero (no change to lm_head at init)
-            torch.nn.init.zeros_(self.unembed_proj_up.weight)
-
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
@@ -342,8 +270,6 @@ class GPT(nn.Module):
         # because GradScaler cannot unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
-            if self.low_dim_embed is not None:
-                self.low_dim_embed.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
 
@@ -396,38 +322,6 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def _build_sentence_mask(self, idx):
-        """Build the boolean [B, 1, T, T] sentence-attention mask (True = attend) for a full
-        sequence (training / no-kv-cache forward). Only called when sentence attention is active.
-
-        allowed = (block_causal | special_visible) & same_doc, with the diagonal forced True.
-        - block_causal:    causal AND k >= closest_boundary(q)  -> the query's own sentence block
-        - special_visible: causal AND key is a gist or BOS      -> earlier gists/BOS always visible
-        - same_doc:        query and key share a document (segment id = cumulative BOS count),
-                           so packed multi-doc rows never leak attention across document boundaries
-        """
-        B, T = idx.shape
-        device = idx.device
-        eos_ids = torch.tensor(self.config.end_of_sentence_token_ids, device=device)
-        gist_mask = (idx.unsqueeze(-1) == eos_ids).any(-1)              # (B, T) gist ids only
-        bos = self.config.bos_token_id
-        special_mask = gist_mask.clone()
-        if bos >= 0:
-            special_mask |= (idx == bos)                                # BOS always-visible
-        eos_idx = _closest_boundary_idx(gist_mask).unsqueeze(-1)        # (B, T, 1)
-        q = torch.arange(T, device=device).view(1, T, 1)
-        k = torch.arange(T, device=device).view(1, 1, T)
-        causal = k <= q                                                 # (1, T, T)
-        block_causal = causal & (k >= eos_idx)                          # (B, T, T)
-        special_visible = causal & special_mask.view(B, 1, T)          # (B, T, T)
-        allowed = block_causal | special_visible
-        if bos >= 0:
-            seg = (idx == bos).cumsum(dim=1)                            # (B, T) document id within row
-            same_doc = seg.unsqueeze(2) == seg.unsqueeze(1)           # (B, T, T)
-            allowed = allowed & same_doc                               # confine attention per-document
-        allowed = allowed | torch.eye(T, dtype=torch.bool, device=device).view(1, T, T)  # self always
-        return allowed.unsqueeze(1)                                     # (B, 1, T, T) bool
-
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -443,8 +337,7 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        low_dim_embed_numel = self.low_dim_embed.weight.numel() if self.low_dim_embed is not None else 0
-        nparams_exclude = (self.transformer.wte.weight.numel() + low_dim_embed_numel + value_embeds_numel +
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
@@ -471,21 +364,14 @@ class GPT(nn.Module):
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        low_dim_embed = self.low_dim_embed.weight.numel() if self.low_dim_embed is not None else 0
-        embed_proj = self.embed_proj.weight.numel() if self.embed_proj is not None else 0
-        unembed_proj = ((self.unembed_proj_down.weight.numel() + self.unembed_proj_up.weight.numel())
-                        if self.unembed_proj_down is not None else 0)
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + low_dim_embed + embed_proj + unembed_proj + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
-            'low_dim_embed': low_dim_embed,
-            'embed_proj': embed_proj,
-            'unembed_proj': unembed_proj,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
@@ -501,17 +387,11 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        low_dim_embed_params = list(self.low_dim_embed.parameters()) if self.low_dim_embed is not None else []
-        embed_proj_params = list(self.embed_proj.parameters()) if self.embed_proj is not None else []
-        unembed_proj_params = (
-            list(self.unembed_proj_down.parameters()) + list(self.unembed_proj_up.parameters())
-            if self.unembed_proj_down is not None else []
-        )
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(low_dim_embed_params) + len(embed_proj_params) + len(unembed_proj_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -522,19 +402,6 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            *(
-                [dict(kind='adamw', params=low_dim_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001)]
-                if low_dim_embed_params else []
-            ),
-            *(
-                [dict(kind='adamw', params=embed_proj_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01)]
-                if embed_proj_params else []
-            ),
-            *(
-                # Low-rank unembedding correction: treat like lm_head (AdamW at unembedding_lr)
-                [dict(kind='adamw', params=unembed_proj_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01)]
-                if unembed_proj_params else []
-            ),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
@@ -567,9 +434,6 @@ class GPT(nn.Module):
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
-        # Linear projection: add low-rank correction from projected low-dim embedding
-        if self.low_dim_embed is not None:
-            x = x + self.embed_proj(self.low_dim_embed(idx))
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
@@ -592,13 +456,6 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
-        # Sentence attention: build the block-causal + global-gist mask from the input ids.
-        # Only for full-sequence (no kv-cache) forward and only when gist tokens are configured;
-        # otherwise attn_mask stays None and the standard causal flash path is used unchanged.
-        attn_mask = None
-        if kv_cache is None and self.config.end_of_sentence_token_ids:
-            attn_mask = self._build_sentence_mask(idx)
-
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
@@ -607,7 +464,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, attn_mask)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -618,9 +475,6 @@ class GPT(nn.Module):
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        # Low-rank unembedding correction: LoRA-style additive term (zero at init)
-        if self.unembed_proj_down is not None:
-            logits = logits + self.unembed_proj_up(self.unembed_proj_down(x))
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
