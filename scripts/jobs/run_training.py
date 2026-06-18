@@ -77,69 +77,6 @@ def linear_projection_embedding_experiments() -> list[dict]:
     return configs
 
 
-def sentence_attention_experiments() -> list[dict]:
-    """Sentence attention: 1 full-causal baseline + 4 sentence-attention arms.
-
-    Sentence attention replaces the causal mask with a block-causal + global-gist mask
-    (a token sees its own current sentence block plus all earlier gist tokens), confined
-    per-document. Gist/end-of-sentence tokens are inserted at NLTK-Punkt sentence boundaries.
-    This group sweeps the number of gist tokens per boundary K in {1,4,8,16} against a
-    full-causal baseline, at d12 / 10k steps / single seed.
-
-    All arms use --window-pattern L so the comparison isolates the sentence mechanism rather
-    than confounding it with nanochat's default sliding-window pattern.
-
-    Evaluation protocol (reviewer-mandated): NO intermediate evaluation runs during training.
-    --eval-every / --core-metric-every / --sample-every are all set to -1, so the 10k steps
-    run uninterrupted and the model is scored ONLY at the end, by the separate post-training
-    evaluation stage (run_evaluation.py -> base_eval.py) on CORE + BPB of the final checkpoint.
-    Gists are excluded from bpb/nats; CORE is reference-only (CORE prompts carry no gists). See
-    experiments/sentence-attention.md for the hypothesis, decision rule, and known threats.
-    """
-    experiment_slug = "sentence-attention"
-    num_gpus = 4
-    instance_type = "a100.4gpu"
-    depth = 12
-    seed = 0
-
-    shared_args = [
-        f"--depth {depth}",
-        "--window-pattern L",
-        "--num-iterations 10000",
-        # Reviewer-mandated: disable ALL in-training evaluation/sampling. Evaluation is deferred
-        # entirely to the post-training stage so the run is never slowed or interrupted mid-train.
-        "--eval-every -1",
-        "--core-metric-every -1",
-        "--sample-every -1",
-    ]
-
-    # (tag, description, extra args). Baseline = full causal, no gists.
-    arms = [
-        ("baseline", "d12 full-causal baseline (no gists), 10k steps", []),
-        ("nltk_k1", "d12 sentence-attn NLTK K=1, 10k steps", ["--gist-placement sentence_nltk", "--num-gist-tokens 1"]),
-        ("nltk_k4", "d12 sentence-attn NLTK K=4, 10k steps", ["--gist-placement sentence_nltk", "--num-gist-tokens 4"]),
-        ("nltk_k8", "d12 sentence-attn NLTK K=8, 10k steps", ["--gist-placement sentence_nltk", "--num-gist-tokens 8"]),
-        ("nltk_k16", "d12 sentence-attn NLTK K=16, 10k steps", ["--gist-placement sentence_nltk", "--num-gist-tokens 16"]),
-    ]
-
-    configs = []
-    for tag, description, extra_args in arms:
-        args_parts = shared_args + extra_args + [f"--seed {seed}"]
-        args_str = " ".join(args_parts).strip()
-        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
-        model_tag = f"d{depth}_sa_{tag}"
-        configs.append({
-            "args": args_str,
-            "model_tag": model_tag,
-            "description": description,
-            "cmd_hash": cmd_hash,
-            "instance_type": instance_type,
-            "experiment_slug": experiment_slug,
-            "num_gpus": num_gpus,
-        })
-    return configs
-
-
 # ---------------------------------------------------------------------------
 # CLI and job submission
 # ---------------------------------------------------------------------------
@@ -206,7 +143,6 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     experiment_configs = [
         *linear_projection_embedding_experiments(),
-        *sentence_attention_experiments(),
     ]
 
     for experiment_config in experiment_configs:

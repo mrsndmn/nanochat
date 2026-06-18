@@ -54,10 +54,6 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--num-train-shards", type=int, default=-1, help="cap on number of train shards used (-1 = all available). Pins the epoch/data budget so a run can be kept within a single epoch (no data repetition); val split always uses the last shard")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--embed-proj-dim", type=int, default=0, help="low-rank embedding projection dim (0=disabled). Adds low_dim_embed + Linear projection summed with wte")
-parser.add_argument("--unembed-proj-dim", type=int, default=0, help="low-rank unembedding correction dim (0=disabled). Adds a LoRA-style low-rank term to lm_head logits")
-# Sentence attention
-parser.add_argument("--gist-placement", type=str, default="none", choices=["none", "sentence_nltk", "uniform"], help="gist/end-of-sentence token insertion strategy (none=disabled; uniform reserved for follow-ups)")
-parser.add_argument("--num-gist-tokens", type=int, default=0, help="K gist tokens inserted per sentence boundary (0=disabled). Enables block-causal + global-gist sentence attention")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -143,18 +139,7 @@ tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 real_vocab_size = tokenizer.get_vocab_size()
 
-# Sentence attention: reserve K gist token ids just past the real vocab, grow the model
-# vocab to cover them (the embedding/lm_head are sized to this), and extend token_bytes with
-# 0-byte entries for the gist ids (so bpb indexing never errors and gists are excluded from bpb).
-gist_token_ids_tuple = ()
-if args.gist_placement != "none" and args.num_gist_tokens > 0:
-    from nanochat.tokenizer import gist_token_ids as _gist_ids_fn
-    gist_token_ids_tuple = tuple(_gist_ids_fn(real_vocab_size, args.num_gist_tokens))
-    vocab_size = real_vocab_size + args.num_gist_tokens
-    token_bytes = torch.cat([token_bytes, torch.zeros(args.num_gist_tokens, dtype=token_bytes.dtype, device=token_bytes.device)], dim=0)
-    print0(f"Sentence attention: {args.num_gist_tokens} gist tokens (ids {gist_token_ids_tuple[0]}..{gist_token_ids_tuple[-1]}), placement={args.gist_placement}")
-else:
-    vocab_size = real_vocab_size
+vocab_size = real_vocab_size
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -172,10 +157,6 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         embed_proj_dim=args.embed_proj_dim,
-        unembed_proj_dim=args.unembed_proj_dim,
-        end_of_sentence_token_ids=gist_token_ids_tuple,
-        full_attention_layers=(),
-        bos_token_id=(tokenizer.get_bos_token_id() if gist_token_ids_tuple else -1),
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -385,8 +366,8 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, num_train_shards=args.num_train_shards, gist_token_ids=gist_token_ids_tuple, gist_placement=args.gist_placement)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, gist_token_ids=gist_token_ids_tuple, gist_placement=args.gist_placement)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, num_train_shards=args.num_train_shards)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
