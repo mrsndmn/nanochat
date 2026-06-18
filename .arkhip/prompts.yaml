@@ -19,3 +19,6 @@ results_script: scripts/results.py
 
 # Deterministic test command run by the testing stage (executed via `bash -c`).
 test_cmd: python -m pytest tests/ -v
+
+# Base branch used by the research loop for diffs / PRs.
+base_branch: origin/main-sentence-attention
