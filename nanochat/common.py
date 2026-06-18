@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 # /workspace-SR004.nfs2, not /mnt/virtual_*). Holds the prepared tokenizer, training data
 # and base checkpoints, shared by the main checkout and every worktree via an ``artifacts``
 # symlink. Override with the NANOCHAT_BASE_DIR env var.
-SHARED_ARTIFACTS_DIR = "/workspace-SR004.nfs2/d.tarasov/nanochat-artifacts"
+SHARED_ARTIFACTS_DIR = "/workspace-SR004.nfs2/d.tarasov/nanochat-artifacts-low-rank-unembedding"
 
 def _ensure_worktree_artifacts_symlink(base_dir):
     """Point a conventional ``artifacts`` base dir at the shared artifacts store.
