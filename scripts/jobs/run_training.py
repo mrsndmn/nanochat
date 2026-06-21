@@ -24,19 +24,33 @@ from typing import List
 
 
 def linear_projection_embedding_experiments() -> list[dict]:
-    """Full-dataset single-epoch (<=1 epoch) 10k-step baseline-vs-proj_512 comparison.
+    """Joint (token_t, token_{t-1}) embedding-side arms vs the reused dense baseline (d12 / 10k / <=1 epoch).
 
-    Tests the linear-projection embed mechanism (`--embed-proj-dim 512` on the proj arm) at
-    d12 over a 10k-step horizon, with the data capped to <=1 epoch (no repetition). Two arms:
-    baseline (embed_proj_dim=0, the default) and proj512. Single seed only — one config per arm
-    (no multi-seed fan-out, per project convention).
+    Prior phases established that the additive per-token projection TIES the dense baseline (baseline
+    val_bpb 0.8058 vs proj512 0.8066 — absorbable into wte) and that separable context terms regress
+    (prevtok512 0.8099, adapter512 0.8075 — redundant with the smear gate + attention). This phase tests
+    two genuinely JOINT (token_t, token_{t-1}) input-side terms — both NON-absorbable into wte and
+    NON-redundant with the separable smear/attention — against the reused dense baseline:
 
-    Data budget: pin all 150 train shards so 10k steps at the (unchanged) 524,288 tok/step
-    global batch consume ~0.78 epoch and the loader never wraps. We deliberately do NOT pass
-    --device-batch-size / --max-seq-len / --total-batch-size, so the global/effective batch
-    size stays exactly as the prior d12 runs.
+      - Arm A — multbigram512: gated MULTIPLICATIVE joint-bigram path (`--embed-ctx-mode mult` over the
+        proj512-equivalent low-dim path). The previous-token low-dim vector modulates the current-token
+        low-dim embedding element-wise behind a learned scalar gate that is ZERO-init (no-op at start) with
+        small-NONZERO projections (so the product trains from step 0).
+      - Arm B — bigramhash512: hashed (prev, cur) bigram-identity input embedding (`--embed-bigram-hash-dim
+        64`, 2^18 buckets), a pair-keyed identity term added to wte behind a small-nonzero gate.
+
+    Arms (single seed, no multi-seed fan-out per project convention):
+      - baseline: reuses the existing d12_baseline_10k_bb2 checkpoint (the launcher skips it).
+      - multbigram512 / bigramhash512: NEW distinct tags so they cannot collide with any existing checkpoint.
+
+    NAMING NOTE: the '512' suffix is a SERIES label for width-comparability with the earlier proj512 arm —
+    it is NOT the literal low-dim width of the hashed path (64) nor the hash bucket count (262144).
+
+    Data budget: pin 150 train shards so 10k steps at the (unchanged) 524,288 tok/step global batch consume
+    <=1 epoch and the loader never wraps. We deliberately do NOT pass --device-batch-size / --max-seq-len /
+    --total-batch-size, so the global/effective batch size stays exactly as the prior d12 runs.
     """
-    experiment_slug = "linear-projection-embeddings-10k-1ep"
+    experiment_slug = "linear-projection-embeddings-10k"
     num_gpus = 4
     instance_type = "a100.4gpu"
     depth = 12
@@ -44,7 +58,7 @@ def linear_projection_embedding_experiments() -> list[dict]:
     # Single seed only — no multi-seed fan-out this phase.
     seed = 0
 
-    num_train_shards = 150  # >= 118 required for >=1 epoch over 10k steps
+    num_train_shards = 150  # >= 118 required for <=1 epoch (no wrap) over 10k steps
 
     shared_args = [
         f"--depth {depth}",
@@ -53,10 +67,11 @@ def linear_projection_embedding_experiments() -> list[dict]:
         f"--num-train-shards {num_train_shards}",
     ]
 
-    # Two arms; the tag encodes proj dim explicitly (baseline = no projection).
+    # Reused dense baseline (existing _bb2 checkpoint) + two NEW joint-bigram arms with distinct tags.
     variants = [
         ("baseline", "d12 baseline (no embed projection), 10k steps, full-dataset single-epoch", []),
-        ("proj512", "d12 embed_proj_dim=512, 10k steps, full-dataset single-epoch", ["--embed-proj-dim 512"]),
+        ("multbigram512", "d12 gated MULTIPLICATIVE joint-bigram input path embed_proj_dim=512 (mult mode), zero-init gate (no-op start) + small-nonzero projections, 10k steps, full-dataset single-epoch", ["--embed-proj-dim 512", "--embed-ctx-mode mult"]),
+        ("bigramhash512", "d12 hashed bigram-identity low-dim input embedding: 2^18 buckets, 64-d, small non-zero proj/gate init (active from step 0), 10k steps, full-dataset single-epoch", ["--embed-bigram-hash-dim 64", "--embed-bigram-hash-buckets 262144", "--embed-bigram-hash-init-std 0.005"]),
     ]
 
     configs = []
@@ -64,7 +79,7 @@ def linear_projection_embedding_experiments() -> list[dict]:
         args_parts = shared_args + extra_args + [f"--seed {seed}"]
         args_str = " ".join(args_parts).strip()
         cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
-        model_tag = f"d{depth}_{tag}_10k_1ep"
+        model_tag = f"d{depth}_{tag}_10k_bb2"
         configs.append({
             "args": args_str,
             "model_tag": model_tag,

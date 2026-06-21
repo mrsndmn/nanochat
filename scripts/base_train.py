@@ -54,6 +54,10 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--num-train-shards", type=int, default=-1, help="cap on number of train shards used (-1 = all available). Pins the epoch/data budget so a run can be kept within a single epoch (no data repetition); val split always uses the last shard")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--embed-proj-dim", type=int, default=0, help="low-rank embedding projection dim (0=disabled). Adds low_dim_embed + Linear projection summed with wte")
+parser.add_argument("--embed-ctx-mode", type=str, default="none", choices=["none", "mult"], help="mechanism A: gated MULTIPLICATIVE joint-bigram input path. 'none' = disabled (default); 'mult' = x += embed_ctx_gate*(embed_proj(low_dim_embed(t)) ⊙ ctx_embed_proj(ctx_low_dim_embed(t-1))). Requires --embed-proj-dim>0; the previous-token path is sized to it. Zero-init learned scalar gate (no-op at init), small-nonzero projections so the product trains from step 0")
+parser.add_argument("--embed-bigram-hash-dim", type=int, default=0, help="mechanism B: hashed bigram-identity low-dim INPUT embedding dim (0=disabled, e.g. 64 when enabled). Hashes the ordered (prev,cur) token pair into --embed-bigram-hash-buckets buckets, looks up a low-dim embedding of this width, bias-free up-projects to n_embd, scales by a learned gate, and adds to wte at the input. Captures the non-additive bigram interaction (not absorbable into wte, not decomposable into per-token sums)")
+parser.add_argument("--embed-bigram-hash-buckets", type=int, default=262144, help="number of hash buckets for the ordered (prev,cur) token pair (default 2^18=262144)")
+parser.add_argument("--embed-bigram-hash-init-std", type=float, default=0.005, help="init std for the bigram hash projection (small NON-zero, not zero-init, so the joint path contributes from step 0; paired with a small non-zero learned gate)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -157,6 +161,10 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         embed_proj_dim=args.embed_proj_dim,
+        embed_ctx_mode=args.embed_ctx_mode,
+        embed_bigram_hash_dim=args.embed_bigram_hash_dim,
+        embed_bigram_hash_buckets=args.embed_bigram_hash_buckets,
+        embed_bigram_hash_init_std=args.embed_bigram_hash_init_std,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

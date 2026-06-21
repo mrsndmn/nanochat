@@ -25,6 +25,25 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
+# Two distinct large odd primes used to hash the ordered (prev, cur) token pair into a bucket id for the
+# hashed bigram-identity input embedding (mechanism B, see GPT.forward). Both are genuine large primes
+# (hence odd), so the multiplicative hash mixes the two token-ids well even under a power-of-two bucket
+# modulus.
+_BIGRAM_HASH_PRIME_PREV = 1_000_000_007
+_BIGRAM_HASH_PRIME_CUR = 998_244_353
+# Small NON-zero init for the learned bigram-hash residual gate (mechanism B), so the joint pair path is
+# active but gentle from step 0 (paired with the small non-zero projection init embed_bigram_hash_init_std).
+# This is deliberately NOT zero-init: the request is for a path that contributes from the very first step.
+_BIGRAM_HASH_GATE_INIT = 0.1
+# Small NON-zero init std for the two projections of the gated MULTIPLICATIVE joint-bigram path
+# (mechanism A, embed_ctx_mode='mult'). The term is gate * (embed_proj(low_dim_embed) ⊙ ctx_embed_proj(ctx_low_dim_embed)).
+# The gate is zero-init so the term is an exact no-op at init. But if the two projections were ALSO zero-init
+# (as in the plain additive path), then cur=ctx_prev=0 and the gate's gradient (∝ cur ⊙ ctx_prev) would be
+# zero too — every gradient into the path would vanish and the all-zero point is a frozen fixed point. Init
+# the projections small-NONZERO so cur, ctx_prev are nonzero and give the zero-init gate a live gradient;
+# with gate=0 the term is still exactly zero at init. (See memory: multiplicative-gated-path-dead-init.)
+_MULT_PROJ_INIT_STD = 0.02
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -40,6 +59,30 @@ class GPTConfig:
     # Linear projection embedding: low-rank correction added to wte.
     # 0 = disabled. When > 0, adds low_dim_embed (vocab × embed_proj_dim) + Linear (embed_proj_dim → n_embd).
     embed_proj_dim: int = 0
+    # Mechanism A — gated MULTIPLICATIVE joint-bigram input path.
+    # 'none' = disabled (default). 'mult' = the previous-token low-dim vector MODULATES the current-token
+    # low-dim embedding element-wise: x = x + embed_ctx_gate * (embed_proj(low_dim_embed(token_t)) ⊙
+    # ctx_embed_proj(ctx_low_dim_embed(token_{t-1}))). This is a genuine (token_t, token_{t-1}) interaction
+    # — non-absorbable into wte and non-redundant with the separable smear / attention. Requires
+    # embed_proj_dim>0 (the current-token low-dim path); the previous-token path (ctx_low_dim_embed /
+    # ctx_embed_proj) is sized to embed_proj_dim. The scalar gate is ZERO-init (exact no-op at init), but
+    # both projections are small-NONZERO so the product has a live gradient at step 0 (see
+    # _MULT_PROJ_INIT_STD). In 'mult' mode the current-token low-dim vector enters ONLY through the product
+    # (no standalone additive term).
+    embed_ctx_mode: str = "none"
+    # Mechanism B — hashed (prev, cur) bigram-identity low-dim INPUT embedding.
+    # 0 = disabled (e.g. 64 when enabled). When > 0, the ordered pair (token_{t-1}, token_t) is hashed into
+    # embed_bigram_hash_buckets buckets, a low-dim vector of width embed_bigram_hash_dim is looked up
+    # (bigram_hash_embed) and bias-free up-projected to n_embd (bigram_hash_proj), scaled by a learned gate,
+    # and ADDED to wte at the input. A pair-identity table captures the NON-additive bigram interaction: it
+    # is neither absorbable into the per-token wte nor decomposable into per-token sums.
+    embed_bigram_hash_dim: int = 0
+    # Number of hash buckets for the ordered (prev, cur) pair (default 2^18 = 262144).
+    embed_bigram_hash_buckets: int = 262144
+    # Init std for the bigram hash projection (bigram_hash_proj). Small NON-zero (NOT zero-init), so the
+    # path contributes from step 0; paired with the small non-zero learned gate, the joint term is active
+    # but gentle from the first step rather than inert until it moves off zero.
+    embed_bigram_hash_init_std: float = 0.005
 
 
 def norm(x):
@@ -196,6 +239,41 @@ class GPT(nn.Module):
         else:
             self.low_dim_embed = None
             self.embed_proj = None
+        # Mechanism A: gated MULTIPLICATIVE (joint) bigram input path (embed_ctx_mode='mult'). The
+        # previous-token low-dim vector modulates the CURRENT-token low-dim embedding element-wise behind a
+        # learned scalar gate. 'mult' requires the current-token low-dim path (embed_proj_dim>0) so the two
+        # projections (each up to n_embd) multiply in the same space — misconfigured arms fail fast here. The
+        # previous-token path (ctx_low_dim_embed / ctx_embed_proj) is sized to embed_proj_dim. The gate is
+        # ZERO-INIT (in init_weights) so the whole multiplicative term is an exact no-op at init: the run
+        # starts identical to the dense baseline and the model opts the path in only if it helps. 'none' (the
+        # default) leaves the gate / ctx modules as None and is unchanged.
+        assert config.embed_ctx_mode in ("none", "mult"), \
+            f"embed_ctx_mode must be 'none' or 'mult', got {config.embed_ctx_mode!r}"
+        if config.embed_ctx_mode == "mult":
+            assert config.embed_proj_dim > 0, (
+                "embed_ctx_mode='mult' requires embed_proj_dim>0 (the current-token low-dim path) so the "
+                "joint product is well-defined"
+            )
+            self.ctx_low_dim_embed = nn.Embedding(padded_vocab_size, config.embed_proj_dim)
+            self.ctx_embed_proj = Linear(config.embed_proj_dim, config.n_embd, bias=False)
+            self.embed_ctx_gate = nn.Parameter(torch.zeros(1))  # fake init (meta); real zero-init in init_weights()
+        else:
+            self.ctx_low_dim_embed = None
+            self.ctx_embed_proj = None
+            self.embed_ctx_gate = None
+        # Mechanism B: hashed bigram-identity low-dim INPUT embedding. A JOINT (prev, cur) pair-identity
+        # table. The ordered pair (token_{t-1}, token_t) is hashed into embed_bigram_hash_buckets buckets
+        # (forward()), a low-dim vector is looked up and bias-free up-projected to n_embd, scaled by a learned
+        # gate, and added to the wte input sum. Both bigram_hash_proj and bigram_hash_gate use a small NON-zero
+        # init (in init_weights), so the path is active (not a no-op) from step 0.
+        if config.embed_bigram_hash_dim > 0:
+            self.bigram_hash_embed = nn.Embedding(config.embed_bigram_hash_buckets, config.embed_bigram_hash_dim)
+            self.bigram_hash_proj = Linear(config.embed_bigram_hash_dim, config.n_embd, bias=False)
+            self.bigram_hash_gate = nn.Parameter(torch.zeros(1))  # fake init (meta); real small non-zero init in init_weights()
+        else:
+            self.bigram_hash_embed = None
+            self.bigram_hash_proj = None
+            self.bigram_hash_gate = None
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -265,8 +343,32 @@ class GPT(nn.Module):
         # Linear projection embedding init
         if self.low_dim_embed is not None:
             torch.nn.init.normal_(self.low_dim_embed.weight, mean=0.0, std=0.8)
-            # Zero-init the projection so the correction starts at zero (no change to wte at init)
-            torch.nn.init.zeros_(self.embed_proj.weight)
+            if self.config.embed_ctx_mode == "mult":
+                # Mechanism A reuses embed_proj as a FACTOR of the gated product. It must be small-NONZERO
+                # (not zero) so the zero-init gate receives a live gradient (∝ cur ⊙ ctx_prev); a zero-init
+                # projection here would freeze the whole multiplicative path at the all-zero fixed point.
+                torch.nn.init.normal_(self.embed_proj.weight, mean=0.0, std=_MULT_PROJ_INIT_STD)
+            else:
+                # Additive path: zero-init the projection so the correction starts at zero (no change to
+                # wte at init); the additive term is linear in embed_proj so low_dim_embed still trains it.
+                torch.nn.init.zeros_(self.embed_proj.weight)
+
+        # Mechanism A (embed_ctx_mode='mult'): ctx_low_dim_embed like wte (normal, std 0.8); ctx_embed_proj
+        # small-NONZERO (the previous-token FACTOR of the product, same dead-init reasoning as embed_proj);
+        # the scalar gate is ZERO-init so the joint product term gate * (cur ⊙ ctx_prev) is an exact no-op at
+        # init — the run starts identical to dense.
+        if self.ctx_low_dim_embed is not None:
+            torch.nn.init.normal_(self.ctx_low_dim_embed.weight, mean=0.0, std=0.8)
+            torch.nn.init.normal_(self.ctx_embed_proj.weight, mean=0.0, std=_MULT_PROJ_INIT_STD)
+            torch.nn.init.zeros_(self.embed_ctx_gate)
+
+        # Mechanism B (hashed bigram-identity input embedding) init: bigram_hash_embed like wte / the other
+        # low-dim tables (normal, std 0.8); bigram_hash_proj at a small NON-zero std (embed_bigram_hash_init_std)
+        # and the gate at a small non-zero value, so the joint pair path is active (NOT a no-op) from step 0.
+        if self.bigram_hash_embed is not None:
+            torch.nn.init.normal_(self.bigram_hash_embed.weight, mean=0.0, std=0.8)
+            torch.nn.init.normal_(self.bigram_hash_proj.weight, mean=0.0, std=self.config.embed_bigram_hash_init_std)
+            torch.nn.init.constant_(self.bigram_hash_gate, _BIGRAM_HASH_GATE_INIT)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
@@ -289,6 +391,10 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             if self.low_dim_embed is not None:
                 self.low_dim_embed.to(dtype=COMPUTE_DTYPE)
+            if self.ctx_low_dim_embed is not None:
+                self.ctx_low_dim_embed.to(dtype=COMPUTE_DTYPE)
+            if self.bigram_hash_embed is not None:
+                self.bigram_hash_embed.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
 
@@ -357,9 +463,18 @@ class GPT(nn.Module):
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
         low_dim_embed_numel = self.low_dim_embed.weight.numel() if self.low_dim_embed is not None else 0
-        nparams_exclude = (self.transformer.wte.weight.numel() + low_dim_embed_numel + value_embeds_numel +
+        # ctx_low_dim_embed (mechanism A) and bigram_hash_embed (mechanism B) are embedding lookups (not
+        # matmuls) => excluded like low_dim_embed. Their projections (ctx_embed_proj / bigram_hash_proj) ARE
+        # real matmuls and stay counted in the 6*(nparams - exclude) term. The two scalar gates are
+        # non-matmul scalars => excluded like the other scalars.
+        ctx_low_dim_embed_numel = self.ctx_low_dim_embed.weight.numel() if self.ctx_low_dim_embed is not None else 0
+        embed_ctx_gate_numel = self.embed_ctx_gate.numel() if self.embed_ctx_gate is not None else 0
+        bigram_hash_embed_numel = self.bigram_hash_embed.weight.numel() if self.bigram_hash_embed is not None else 0
+        bigram_hash_gate_numel = self.bigram_hash_gate.numel() if self.bigram_hash_gate is not None else 0
+        nparams_exclude = (self.transformer.wte.weight.numel() + low_dim_embed_numel + ctx_low_dim_embed_numel + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() +
+                          embed_ctx_gate_numel + bigram_hash_embed_numel + bigram_hash_gate_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -386,16 +501,31 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         low_dim_embed = self.low_dim_embed.weight.numel() if self.low_dim_embed is not None else 0
         embed_proj = self.embed_proj.weight.numel() if self.embed_proj is not None else 0
+        # Mechanism A (mult): the previous-token low-dim table is an embedding lookup; its projection is a
+        # real matmul. Reported separately (mirroring low_dim_embed / embed_proj). The 1-element gate folds
+        # into scalars below.
+        ctx_low_dim_embed = self.ctx_low_dim_embed.weight.numel() if self.ctx_low_dim_embed is not None else 0
+        ctx_embed_proj = self.ctx_embed_proj.weight.numel() if self.ctx_embed_proj is not None else 0
+        embed_ctx_gate = self.embed_ctx_gate.numel() if self.embed_ctx_gate is not None else 0
+        # Mechanism B (hashed bigram-identity): the bucket table is an embedding lookup, the projection is a
+        # real matmul; the 1-element gate folds into scalars below.
+        bigram_hash_embed = self.bigram_hash_embed.weight.numel() if self.bigram_hash_embed is not None else 0
+        bigram_hash_proj = self.bigram_hash_proj.weight.numel() if self.bigram_hash_proj is not None else 0
+        bigram_hash_gate = self.bigram_hash_gate.numel() if self.bigram_hash_gate is not None else 0
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + low_dim_embed + embed_proj + value_embeds + lm_head + transformer_matrices + scalars
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() + embed_ctx_gate + bigram_hash_gate
+        total = wte + low_dim_embed + embed_proj + ctx_low_dim_embed + ctx_embed_proj + bigram_hash_embed + bigram_hash_proj + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'low_dim_embed': low_dim_embed,
             'embed_proj': embed_proj,
+            'ctx_low_dim_embed': ctx_low_dim_embed,
+            'ctx_embed_proj': ctx_embed_proj,
+            'bigram_hash_embed': bigram_hash_embed,
+            'bigram_hash_proj': bigram_hash_proj,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
@@ -413,11 +543,23 @@ class GPT(nn.Module):
         embedding_params = list(self.transformer.wte.parameters())
         low_dim_embed_params = list(self.low_dim_embed.parameters()) if self.low_dim_embed is not None else []
         embed_proj_params = list(self.embed_proj.parameters()) if self.embed_proj is not None else []
+        # Mechanism A (mult): dedicated AdamW groups mirroring low_dim_embed / embed_proj (same LRs). The
+        # previous-token table rides the embedding group; its projection rides the projection group.
+        ctx_low_dim_embed_params = list(self.ctx_low_dim_embed.parameters()) if self.ctx_low_dim_embed is not None else []
+        ctx_embed_proj_params = list(self.ctx_embed_proj.parameters()) if self.ctx_embed_proj is not None else []
+        # Mechanism B (hashed bigram-identity): dedicated AdamW groups mirroring low_dim_embed / embed_proj.
+        # The learned gate rides the projection group (bigram_hash_proj + gate), like a small matmul-side scalar.
+        bigram_hash_embed_params = list(self.bigram_hash_embed.parameters()) if self.bigram_hash_embed is not None else []
+        bigram_hash_proj_params = (list(self.bigram_hash_proj.parameters()) + [self.bigram_hash_gate]) if self.bigram_hash_proj is not None else []
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(low_dim_embed_params) + len(embed_proj_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        # Mechanism A multiplicative gate: a learned scalar; ride the scalar-style smear AdamW group
+        # (lr=0.2, no weight decay) when present. Owned by exactly one group.
+        if self.embed_ctx_gate is not None:
+            smear_params.append(self.embed_ctx_gate)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(low_dim_embed_params) + len(embed_proj_params) + len(ctx_low_dim_embed_params) + len(ctx_embed_proj_params) + len(bigram_hash_embed_params) + len(bigram_hash_proj_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -435,6 +577,22 @@ class GPT(nn.Module):
             *(
                 [dict(kind='adamw', params=embed_proj_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01)]
                 if embed_proj_params else []
+            ),
+            *(
+                [dict(kind='adamw', params=ctx_low_dim_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001)]
+                if ctx_low_dim_embed_params else []
+            ),
+            *(
+                [dict(kind='adamw', params=ctx_embed_proj_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01)]
+                if ctx_embed_proj_params else []
+            ),
+            *(
+                [dict(kind='adamw', params=bigram_hash_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001)]
+                if bigram_hash_embed_params else []
+            ),
+            *(
+                [dict(kind='adamw', params=bigram_hash_proj_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01)]
+                if bigram_hash_proj_params else []
             ),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
@@ -455,6 +613,55 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _shift_ctx_prev(self, ctx, kv_cache):
+        """Causally right-shift the per-current-token context vector so position t reads token t-1.
+
+        Position 0 has no predecessor => zeros (training / full-sequence eval; no future-token leakage).
+        Under a KV cache the previous token's ctx is carried across forward calls (mirrors the smear
+        `prev_embedding` plumbing) so the joint product is well-defined under single-token decode.
+        """
+        if kv_cache is None:
+            # Training / full-sequence eval: shift right by one so position t reads token t-1;
+            # position 0 has no predecessor and gets zeros (causal — no future-token leakage).
+            return F.pad(ctx, (0, 0, 1, 0))[:, :-1, :]
+        # KV-cache inference: carry the previous token's ctx across forward calls (mirrors smear).
+        prev_ctx = kv_cache.prev_ctx
+        kv_cache.prev_ctx = ctx[:, -1:, :]  # stash current last-token ctx for the next step
+        T = ctx.size(1)
+        if T > 1:
+            # Prefill: shift within the chunk; first position uses the carried prev (zeros if fresh cache).
+            head = prev_ctx if prev_ctx is not None else torch.zeros_like(ctx[:, :1, :])
+            return torch.cat([head, ctx[:, :-1, :]], dim=1)
+        elif prev_ctx is not None:
+            # Decode: single token reads the cached previous token's ctx.
+            return prev_ctx
+        else:
+            return torch.zeros_like(ctx)
+
+    def _shift_prev_token(self, idx, kv_cache):
+        """Causally right-shift the token-id sequence so position t sees token t-1.
+
+        Position 0 has no predecessor => sentinel id 0 (no future-token leakage). Under a KV cache the
+        previous token id is carried across forward calls (mirrors the smear / ctx plumbing) so the ordered
+        (prev, cur) pair is well-defined under single-token decode.
+        """
+        if kv_cache is None:
+            # Training / full-sequence eval: shift right by one; position 0 uses sentinel 0 (causal).
+            return F.pad(idx, (1, 0))[:, :-1]
+        # KV-cache inference: carry the previous token id across forward calls (mirrors prev_ctx / smear).
+        prev_tok = kv_cache.prev_token_id
+        kv_cache.prev_token_id = idx[:, -1:]  # stash current last token id for the next step
+        T = idx.size(1)
+        if T > 1:
+            # Prefill: shift within the chunk; first position uses the carried prev (sentinel 0 if fresh).
+            head = prev_tok if prev_tok is not None else torch.zeros_like(idx[:, :1])
+            return torch.cat([head, idx[:, :-1]], dim=1)
+        elif prev_tok is not None:
+            # Decode: single token reads the cached previous token id.
+            return prev_tok
+        else:
+            return torch.zeros_like(idx)
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
@@ -470,7 +677,30 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         # Linear projection: add low-rank correction from projected low-dim embedding
         if self.low_dim_embed is not None:
-            x = x + self.embed_proj(self.low_dim_embed(idx))
+            cur_proj = self.embed_proj(self.low_dim_embed(idx)) # (B, T, n_embd): per-current-token low-rank vector
+            if self.config.embed_ctx_mode == "mult":
+                # Mechanism A: gated MULTIPLICATIVE (joint) bigram input path. The previous-token low-dim
+                # vector modulates the CURRENT-token low-dim embedding element-wise. In this mode the
+                # current-token low-dim vector enters ONLY through the product (NOT also added standalone).
+                # The gate is zero-init, so the whole term is an exact no-op at init.
+                ctx = self.ctx_embed_proj(self.ctx_low_dim_embed(idx)) # (B, T, n_embd): per-current-token low-rank vector
+                ctx_prev = self._shift_ctx_prev(ctx, kv_cache)         # causally shifted/carried to token t-1
+                x = x + self.embed_ctx_gate.to(x.dtype) * (cur_proj * ctx_prev)
+            else:
+                # Additive per-token projection (default): a low-rank correction summed into wte.
+                x = x + cur_proj
+        # Mechanism B: hashed (prev, cur) bigram-identity INPUT embedding. The ordered pair
+        # (token_{t-1}, token_t) is hashed (two distinct large odd primes; deterministic, on-device) into a
+        # fixed bucket table, looked up, bias-free up-projected, gated, and ADDED to the wte input sum. The
+        # previous token is the causal right-shift of idx (position 0 -> sentinel 0, no future-token leakage),
+        # so the term depends jointly on two token-ids and is neither absorbable into the per-token wte nor
+        # decomposable into per-token sums. Independent of embed_ctx_mode.
+        if self.bigram_hash_embed is not None:
+            prev = self._shift_prev_token(idx, kv_cache)
+            buckets = self.config.embed_bigram_hash_buckets
+            bucket = (prev.to(torch.long) * _BIGRAM_HASH_PRIME_PREV + idx.to(torch.long) * _BIGRAM_HASH_PRIME_CUR) % buckets
+            bigram = self.bigram_hash_proj(self.bigram_hash_embed(bucket)) # (B, T, n_embd)
+            x = x + self.bigram_hash_gate.to(x.dtype) * bigram
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 

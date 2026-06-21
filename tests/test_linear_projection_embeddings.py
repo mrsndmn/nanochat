@@ -1,9 +1,11 @@
 """
-Tests for the full-dataset single-epoch 10k-step linear-projection comparison.
+Tests for the joint (token_t, token_{t-1}) embedding-side 10k-step comparison.
 
-Exercises scripts.jobs.run_training.linear_projection_embedding_experiments: it must emit
-exactly one training run per arm (baseline + proj_512), at a single seed and the 10k-step
-horizon, capped to <=1 epoch over the expanded shards with the global batch size unchanged.
+Exercises scripts.jobs.run_training.linear_projection_embedding_experiments: it must emit exactly one
+training run per arm — the REUSED dense baseline (d12_baseline_10k_bb2, an existing checkpoint the
+launcher skips) plus two NEW joint-bigram arms with distinct tags (d12_multbigram512_10k_bb2,
+d12_bigramhash512_10k_bb2) — at a single seed and the 10k-step horizon, capped to <=1 epoch over the
+pinned shards with the global batch size unchanged.
 
 Run: python -m pytest tests/test_linear_projection_embeddings.py -v
 """
@@ -17,13 +19,19 @@ REQUIRED_KEYS = {
     "experiment_slug", "num_gpus",
 }
 
+EXPECTED_TAGS = [
+    "d12_baseline_10k_bb2",
+    "d12_multbigram512_10k_bb2",
+    "d12_bigramhash512_10k_bb2",
+]
 
-def test_exactly_two_single_run_configs():
+
+def test_exactly_three_single_run_configs():
     configs = linear_projection_embedding_experiments()
-    assert len(configs) == 2
+    assert len(configs) == 3
     tags = [c["model_tag"] for c in configs]
-    assert tags == ["d12_baseline_10k_1ep", "d12_proj512_10k_1ep"]
-    assert len(set(tags)) == 2
+    assert tags == EXPECTED_TAGS
+    assert len(set(tags)) == 3  # all distinct => no checkpoint collisions
 
 
 def test_single_seed_only():
@@ -52,17 +60,41 @@ def test_d12_and_no_d20_or_d6():
         assert "d6" not in c["model_tag"]
 
 
-def test_arms_are_baseline_and_proj512():
-    configs = linear_projection_embedding_experiments()
-    by_tag = {c["model_tag"]: c for c in configs}
-    assert "--embed-proj-dim" not in by_tag["d12_baseline_10k_1ep"]["args"]
-    assert "--embed-proj-dim 512" in by_tag["d12_proj512_10k_1ep"]["args"]
+def test_baseline_reuses_bb2_checkpoint_and_has_no_embed_flags():
+    by_tag = {c["model_tag"]: c for c in linear_projection_embedding_experiments()}
+    assert "d12_baseline_10k_bb2" in by_tag  # reuse => launcher skips retraining the dense baseline
+    base = by_tag["d12_baseline_10k_bb2"]["args"]
+    for flag in ("--embed-proj-dim", "--embed-ctx-mode", "--embed-bigram-hash-dim",
+                 "--embed-bigram-hash-buckets", "--embed-bigram-hash-init-std"):
+        assert flag not in base
+
+
+def test_multbigram_arm_carries_mult_flags_at_proj512_rank():
+    by_tag = {c["model_tag"]: c for c in linear_projection_embedding_experiments()}
+    args = by_tag["d12_multbigram512_10k_bb2"]["args"]
+    # The joint multiplicative path needs the current-token low-dim path at the proj512-equivalent rank
+    # plus mult mode (the previous-token path is sized to embed_proj_dim by the model).
+    assert "--embed-proj-dim 512" in args
+    assert "--embed-ctx-mode mult" in args
+    # It is NOT the hashed-bigram mechanism.
+    assert "--embed-bigram-hash-dim" not in args
+
+
+def test_bigramhash_arm_carries_hash_flags():
+    by_tag = {c["model_tag"]: c for c in linear_projection_embedding_experiments()}
+    args = by_tag["d12_bigramhash512_10k_bb2"]["args"]
+    assert "--embed-bigram-hash-dim 64" in args
+    assert "--embed-bigram-hash-buckets 262144" in args
+    assert "--embed-bigram-hash-init-std 0.005" in args
+    # It is NOT the multiplicative mechanism.
+    assert "--embed-ctx-mode" not in args
+    assert "--embed-proj-dim" not in args
 
 
 def test_slug():
     configs = linear_projection_embedding_experiments()
     for c in configs:
-        assert c["experiment_slug"] == "linear-projection-embeddings-10k-1ep"
+        assert c["experiment_slug"] == "linear-projection-embeddings-10k"
 
 
 def test_required_keys_and_node_settings():
@@ -73,7 +105,7 @@ def test_required_keys_and_node_settings():
         assert c["num_gpus"] == 4
 
 
-# --- data budget: <= 1 epoch over the expanded shards ------------------------
+# --- data budget: <= 1 epoch over the pinned shards --------------------------
 
 # Global batch is 524,288 tokens/step (device_batch 32 * grad_accum 2 * gpus 4 * seq 2048),
 # so 10k steps train 5.243e9 tokens. With ~44.7e6 trained tokens/shard that needs >=118 shards
