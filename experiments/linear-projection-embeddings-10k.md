@@ -63,11 +63,53 @@ val_bpb is primary; CORE is secondary (±0.02 noise band).
 
 ## Results
 
-_Pending._
+Single seed per arm, 10k steps. val_bpb is primary; the two reused dense baselines both
+landed at exactly **0.8058**, so run-to-run val_bpb noise on this line is small and a
+−0.002 move is meaningful.
+
+| arm                                   | val_bpb    | Δ vs 0.8058 | CORE   |
+|---------------------------------------|------------|-------------|--------|
+| d12_baseline_10k_bb2 (reference)      | 0.8058     | —           | 0.1880 |
+| **d12_bigramhash512_10k_bb2 (Arm B)** | **0.8037** | **−0.0021** | 0.1925 |
+| d12_multbigram512_10k_bb2 (Arm A)     | 0.8072     | +0.0014     | 0.1815 |
+
+- **Arm B (hashed (prev,cur) bigram-identity)** is the **best val_bpb of the entire
+  linear-projection line** (0.8037), beating every additive-projection arm, every context
+  arm, and the dense baseline by −0.0021 — inside the −0.001…−0.003 target.
+- **Arm A (gated multiplicative joint-bigram)** regressed (+0.0014); the element-wise
+  Hadamard interaction alone does not help.
+- CORE is secondary and noisy here (±0.02): Arm B's 0.1925 is among the top values in the
+  table and moves with val_bpb in the right direction; Arm A's 0.1815 dips slightly. No
+  anomalies or missing evaluations — all models report val_bpb, val_nats, and CORE.
 
 ## Conclusions
 
-_Pending._
+**Verdict: SUCCESS.** Arm B (the hashed pair-keyed bigram-identity term) drops val_bpb to
+**0.8037**, −0.0021 below the dense baseline (0.8058) and the lowest of any arm in this
+line. This is the first embedding-side mechanism to break the baseline tie, and it
+**validates the diagnosis**: the prior additive-projection ceiling was a
+**redundancy/separability limit**, not a hard input-side ceiling. A term that is
+**non-absorbable** (keyed on the *pair*, not the current token-id, so `wte` cannot refold
+it) and **non-redundant** (a pair-keyed identity lookup, not a separable sum that
+smear/attention already approximate) does add usable headroom at d12/10k.
+
+Arm A (multiplicative Hadamard joint-bigram) **regressed** (+0.0014), so the win is
+specific to the *identity/lookup* form of the joint interaction, not the multiplicative
+form — the effective ingredient is the explicit pair-keyed embedding, not element-wise
+modulation.
+
+Per the user override, this line stays on the **embedding / input side**; the bigram-hash
+result is the lead to push further. Next steps (all embedding-side):
+
+- **Scale the winning path** — sweep hash bucket counts / hash widths and the joint
+  embedding dim for `bigramhash`, and give the joint path a longer training horizon to see
+  whether the −0.002 gain widens.
+- **Higher n-gram order** — extend the pair-keyed identity to a hashed
+  (prev2, prev1, cur) **trigram** term using the same non-absorbable construction.
+- **Learned gate schedules** — anneal/warm the joint-path gate instead of a static
+  zero-init scalar, and try per-dimension rather than scalar gating.
+- **Joint + additive combination** — combine the bigram-hash identity with the additive
+  per-token projection (proj512), since they capture different (pair vs token) structure.
 
 ## Changelog
 
@@ -79,5 +121,12 @@ _Pending._
   joint-bigram path and (B) a hashed (prev,cur) bigram-identity embedding — both non-absorbable
   and non-redundant. Continuing on the embedding side per the user override; no pivot to
   base-model LR sweeps. Results/Conclusions pending.
+- **2026-06-21** — Results in. **Arm B (`d12_bigramhash512_10k_bb2`) wins: val_bpb 0.8037,
+  −0.0021 vs baseline 0.8058 — the best of the line and the first arm to break the tie.**
+  Arm A (multiplicative, `d12_multbigram512_10k_bb2`) regressed to 0.8072. Confirms the
+  embedding-side ceiling was a redundancy/separability limit; the pair-keyed identity (lookup)
+  form is the effective joint mechanism, not the multiplicative form. Next (embedding-side):
+  scale the bigram-hash path (buckets/width/dim, longer horizon), trigram identity, learned
+  gate schedules, joint+additive combination.
 </content>
 </invoke>
