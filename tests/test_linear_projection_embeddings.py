@@ -3,9 +3,10 @@ Tests for the joint (token_t, token_{t-1}) embedding-side 10k-step comparison.
 
 Exercises scripts.jobs.run_training.linear_projection_embedding_experiments: it must emit exactly one
 training run per arm — the REUSED dense baseline (d12_baseline_10k_bb2, an existing checkpoint the
-launcher skips) plus two NEW joint-bigram arms with distinct tags (d12_multbigram512_10k_bb2,
-d12_bigramhash512_10k_bb2) — at a single seed and the 10k-step horizon, capped to <=1 epoch over the
-pinned shards with the global batch size unchanged.
+launcher skips), the two original joint-bigram arms (d12_multbigram512_10k_bb2, d12_bigramhash512_10k_bb2),
+plus the 6 NEW bigram-hash SCALING arms: a HASH-DIM sweep (dim 32/128/256/512 at fixed 2^18 buckets) and a
+BUCKET sweep (2^16/2^20 buckets at fixed dim 64) around the winning bigramhash512 center — at a single seed
+and the 10k-step horizon, capped to <=1 epoch over the pinned shards with the global batch size unchanged.
 
 Run: python -m pytest tests/test_linear_projection_embeddings.py -v
 """
@@ -23,15 +24,23 @@ EXPECTED_TAGS = [
     "d12_baseline_10k_bb2",
     "d12_multbigram512_10k_bb2",
     "d12_bigramhash512_10k_bb2",
+    # HASH-DIM sweep (buckets fixed 2^18, init-std 0.005)
+    "d12_bigramhash_d32_10k_bb2",
+    "d12_bigramhash_d128_10k_bb2",
+    "d12_bigramhash_d256_10k_bb2",
+    "d12_bigramhash_d512_10k_bb2",
+    # BUCKET sweep (dim fixed 64, init-std 0.005)
+    "d12_bigramhash_b16_10k_bb2",
+    "d12_bigramhash_b20_10k_bb2",
 ]
 
 
-def test_exactly_three_single_run_configs():
+def test_exactly_nine_single_run_configs():
     configs = linear_projection_embedding_experiments()
-    assert len(configs) == 3
+    assert len(configs) == 9
     tags = [c["model_tag"] for c in configs]
     assert tags == EXPECTED_TAGS
-    assert len(set(tags)) == 3  # all distinct => no checkpoint collisions
+    assert len(set(tags)) == 9  # all distinct => no checkpoint collisions
 
 
 def test_single_seed_only():
@@ -89,6 +98,58 @@ def test_bigramhash_arm_carries_hash_flags():
     # It is NOT the multiplicative mechanism.
     assert "--embed-ctx-mode" not in args
     assert "--embed-proj-dim" not in args
+
+
+# --- bigram-hash scaling sweeps around the bigramhash512 center --------------
+
+# HASH-DIM sweep: buckets fixed at 2^18=262144, init-std 0.005, vary the hash dim.
+HASH_DIM_SWEEP = {
+    "d12_bigramhash_d32_10k_bb2": 32,
+    "d12_bigramhash_d128_10k_bb2": 128,
+    "d12_bigramhash_d256_10k_bb2": 256,
+    "d12_bigramhash_d512_10k_bb2": 512,
+}
+
+# BUCKET sweep: dim fixed at 64, init-std 0.005, vary the bucket count.
+BUCKET_SWEEP = {
+    "d12_bigramhash_b16_10k_bb2": 65536,
+    "d12_bigramhash_b20_10k_bb2": 1048576,
+}
+
+
+def test_hash_dim_sweep_arms_carry_expected_flags():
+    by_tag = {c["model_tag"]: c for c in linear_projection_embedding_experiments()}
+    for tag, dim in HASH_DIM_SWEEP.items():
+        assert tag in by_tag, f"missing hash-dim sweep arm {tag}"
+        args = by_tag[tag]["args"]
+        assert f"--embed-bigram-hash-dim {dim}" in args
+        assert "--embed-bigram-hash-buckets 262144" in args  # buckets fixed at the center
+        assert "--embed-bigram-hash-init-std 0.005" in args
+        # Pure hashed-bigram mechanism — not multiplicative / additive projection.
+        assert "--embed-ctx-mode" not in args
+        assert "--embed-proj-dim" not in args
+
+
+def test_bucket_sweep_arms_carry_expected_flags():
+    by_tag = {c["model_tag"]: c for c in linear_projection_embedding_experiments()}
+    for tag, buckets in BUCKET_SWEEP.items():
+        assert tag in by_tag, f"missing bucket sweep arm {tag}"
+        args = by_tag[tag]["args"]
+        assert "--embed-bigram-hash-dim 64" in args  # dim fixed at the center
+        assert f"--embed-bigram-hash-buckets {buckets}" in args
+        assert "--embed-bigram-hash-init-std 0.005" in args
+        # Pure hashed-bigram mechanism — not multiplicative / additive projection.
+        assert "--embed-ctx-mode" not in args
+        assert "--embed-proj-dim" not in args
+
+
+def test_sweeps_do_not_duplicate_the_center():
+    # The bigramhash512 center (dim=64, buckets=262144) must appear exactly once and not be
+    # re-added under a sweep tag.
+    by_tag = {c["model_tag"]: c for c in linear_projection_embedding_experiments()}
+    center_args = by_tag["d12_bigramhash512_10k_bb2"]["args"]
+    for tag in list(HASH_DIM_SWEEP) + list(BUCKET_SWEEP):
+        assert by_tag[tag]["args"] != center_args, f"{tag} duplicates the bigramhash512 center"
 
 
 def test_slug():

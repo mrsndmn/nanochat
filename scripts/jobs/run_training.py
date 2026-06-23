@@ -39,12 +39,30 @@ def linear_projection_embedding_experiments() -> list[dict]:
       - Arm B — bigramhash512: hashed (prev, cur) bigram-identity input embedding (`--embed-bigram-hash-dim
         64`, 2^18 buckets), a pair-keyed identity term added to wte behind a small-nonzero gate.
 
+    Arm B won the prior phase (bigramhash512 val_bpb 0.8037, -0.0021 vs the 0.8058 baseline — the best of the
+    whole linear-projection line). This phase SCALES the winning hashed pair-identity path with two 1-D
+    ablation sweeps around its operating point (dim=64, buckets=2^18=262144, init-std 0.005), reusing the
+    existing bigramhash512 tuple as the shared center for BOTH sweeps (the center is NOT re-added as a
+    duplicate, and we do NOT build the full dim x bucket grid):
+
+      - HASH-DIM sweep (buckets fixed at 262144, init-std 0.005): dim in {32, 128, 256, 512}
+        (tags bigramhash_d32 / d128 / d256 / d512) — find the best joint-embedding width for the pair term.
+      - BUCKET sweep (dim fixed at 64, init-std 0.005): buckets in {2^16=65536, 2^20=1048576}
+        (tags bigramhash_b16 / b20) — find the best hash bucket count (collision rate) for the pair term.
+
+    Intent: locate the best hash-dim and bucket count for the joint (prev,cur) pair-identity term, i.e. whether
+    a wider low-dim lookup or more/fewer buckets widens the -0.002 win. Arm A (multbigram512) is kept unchanged
+    as a reference; it regressed (+0.0014) and is not swept.
+
     Arms (single seed, no multi-seed fan-out per project convention):
       - baseline: reuses the existing d12_baseline_10k_bb2 checkpoint (the launcher skips it).
-      - multbigram512 / bigramhash512: NEW distinct tags so they cannot collide with any existing checkpoint.
+      - multbigram512 / bigramhash512 + the 6 NEW sweep arms: distinct tags so they cannot collide with any
+        existing checkpoint.
 
-    NAMING NOTE: the '512' suffix is a SERIES label for width-comparability with the earlier proj512 arm —
-    it is NOT the literal low-dim width of the hashed path (64) nor the hash bucket count (262144).
+    NAMING NOTE: the '512' suffix on multbigram512 / bigramhash512 is a SERIES label for width-comparability
+    with the earlier proj512 arm — it is NOT the literal low-dim width of the hashed path (64) nor the hash
+    bucket count (262144). The NEW sweep tags instead encode the swept value directly: bigramhash_d{N} is the
+    hash-dim (N in {32,128,256,512}) and bigramhash_b{K} is log2 of the bucket count (b16=2^16, b20=2^20).
 
     Data budget: pin 150 train shards so 10k steps at the (unchanged) 524,288 tok/step global batch consume
     <=1 epoch and the loader never wraps. We deliberately do NOT pass --device-batch-size / --max-seq-len /
@@ -72,6 +90,14 @@ def linear_projection_embedding_experiments() -> list[dict]:
         ("baseline", "d12 baseline (no embed projection), 10k steps, full-dataset single-epoch", []),
         ("multbigram512", "d12 gated MULTIPLICATIVE joint-bigram input path embed_proj_dim=512 (mult mode), zero-init gate (no-op start) + small-nonzero projections, 10k steps, full-dataset single-epoch", ["--embed-proj-dim 512", "--embed-ctx-mode mult"]),
         ("bigramhash512", "d12 hashed bigram-identity low-dim input embedding: 2^18 buckets, 64-d, small non-zero proj/gate init (active from step 0), 10k steps, full-dataset single-epoch", ["--embed-bigram-hash-dim 64", "--embed-bigram-hash-buckets 262144", "--embed-bigram-hash-init-std 0.005"]),
+        # HASH-DIM sweep around the bigramhash512 center (buckets fixed 2^18=262144, init-std 0.005): vary the low-dim joint-embedding width.
+        ("bigramhash_d32", "d12 hashed bigram-identity input embedding HASH-DIM sweep: dim=32, 2^18 buckets, init-std 0.005, 10k steps, full-dataset single-epoch", ["--embed-bigram-hash-dim 32", "--embed-bigram-hash-buckets 262144", "--embed-bigram-hash-init-std 0.005"]),
+        ("bigramhash_d128", "d12 hashed bigram-identity input embedding HASH-DIM sweep: dim=128, 2^18 buckets, init-std 0.005, 10k steps, full-dataset single-epoch", ["--embed-bigram-hash-dim 128", "--embed-bigram-hash-buckets 262144", "--embed-bigram-hash-init-std 0.005"]),
+        ("bigramhash_d256", "d12 hashed bigram-identity input embedding HASH-DIM sweep: dim=256, 2^18 buckets, init-std 0.005, 10k steps, full-dataset single-epoch", ["--embed-bigram-hash-dim 256", "--embed-bigram-hash-buckets 262144", "--embed-bigram-hash-init-std 0.005"]),
+        ("bigramhash_d512", "d12 hashed bigram-identity input embedding HASH-DIM sweep: dim=512, 2^18 buckets, init-std 0.005, 10k steps, full-dataset single-epoch", ["--embed-bigram-hash-dim 512", "--embed-bigram-hash-buckets 262144", "--embed-bigram-hash-init-std 0.005"]),
+        # BUCKET sweep around the bigramhash512 center (dim fixed 64, init-std 0.005): vary the hash bucket count (collision rate).
+        ("bigramhash_b16", "d12 hashed bigram-identity input embedding BUCKET sweep: 2^16=65536 buckets, 64-d, init-std 0.005, 10k steps, full-dataset single-epoch", ["--embed-bigram-hash-dim 64", "--embed-bigram-hash-buckets 65536", "--embed-bigram-hash-init-std 0.005"]),
+        ("bigramhash_b20", "d12 hashed bigram-identity input embedding BUCKET sweep: 2^20=1048576 buckets, 64-d, init-std 0.005, 10k steps, full-dataset single-epoch", ["--embed-bigram-hash-dim 64", "--embed-bigram-hash-buckets 1048576", "--embed-bigram-hash-init-std 0.005"]),
     ]
 
     configs = []
