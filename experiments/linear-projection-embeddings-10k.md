@@ -168,5 +168,17 @@ pivot). Next steps:
   non-absorbable/non-redundant in practice. CORE noisy/decoupled (not read). Next
   (embedding-side, no LR pivot): joint dim 128 × 2^20, push to 2^22 buckets, param-matched
   control, trigram identity.
+- **2026-06-25** — Evaluation pipeline aggregation complete (CORE + BPB, all arms reporting,
+  no missing evals); the bigram-hash dim/bucket ablation is **confirmed and finalized** against
+  the dense baseline 0.8058. Re-reading the two 1-D sweeps separately: **BUCKET** (dim 64) is
+  monotone and unsaturated — 2^16/2^18/2^20 → 0.8052/0.8037/0.8014, the largest step at the top
+  end; **HASH-DIM** (2^18 buckets) is an inverted-U with an interior sweet spot at dim 128
+  (0.8033), regressing at 256/512. **Both arms above the center beat it** (d128 0.8033, b20
+  0.8014 vs center 0.8037), and **all seven hashed arms stay below 0.8058** → success met
+  comprehensively. Best operating point **dim 64 × 2^20 = 0.8014 (−0.0044)**, the lowest of the
+  line; bucket count is the dominant lever, hash-dim a shallow second-order knob. CORE decoupled
+  (0.178–0.195, within the ±0.02 noise band) — not read. Next embedding-side step (no LR pivot):
+  push the unsaturated bucket lever to **2^22 @ dim 64**, then probe the compound **dim 128 ×
+  2^20** point; param-matched control and trigram identity follow.
 </content>
 </invoke>
