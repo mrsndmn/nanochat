@@ -76,36 +76,45 @@ multiplicative Hadamard term regressed.
 | bigramhash512 (dim 64, 2^18)       | 0.8037     | −0.0021     | 0.1925 |
 | multbigram512 (Arm A)              | 0.8072     | +0.0014     | 0.1815 |
 
-**HASH-DIM sweep** (buckets fixed 2^18, init-std 0.005):
+**HASH-DIM sweep** (buckets fixed 2^18, init-std 0.005). Δ vs center = vs the 0.8037 center:
 
-| hash dim    | val_bpb    | Δ vs 0.8058 | CORE   |
-|-------------|------------|-------------|--------|
-| 32          | 0.8043     | −0.0015     | 0.1946 |
-| 64 (center) | 0.8037     | −0.0021     | 0.1925 |
-| **128**     | **0.8033** | **−0.0025** | 0.1782 |
-| 256         | 0.8041     | −0.0017     | 0.1911 |
-| 512         | 0.8044     | −0.0014     | 0.1906 |
+| hash dim    | val_bpb    | Δ vs 0.8058 | Δ vs center | CORE   |
+|-------------|------------|-------------|-------------|--------|
+| 32          | 0.8043     | −0.0015     | +0.0006     | 0.1946 |
+| 64 (center) | 0.8037     | −0.0021     | —           | 0.1925 |
+| **128**     | **0.8033** | **−0.0025** | **−0.0004** | 0.1782 |
+| 256         | 0.8041     | −0.0017     | +0.0004     | 0.1911 |
+| 512         | 0.8044     | −0.0014     | +0.0007     | 0.1906 |
 
 Inverted-U with an interior sweet spot at **dim 128** (0.8033); width above 128 regresses
 (256, 512), consistent with overfitting/saturation at 10k steps. All five widths beat the
-baseline; the spread is shallow (~0.001).
+baseline, but only **dim 128 edges past the center** (−0.0004) — and only marginally; the
+spread is shallow (~0.001). Width essentially **reproduces** the center win, not widens it.
 
-**BUCKET sweep** (dim fixed 64, init-std 0.005):
+**BUCKET sweep** (dim fixed 64, init-std 0.005). Δ vs center = vs the 0.8037 center:
 
-| buckets       | val_bpb    | Δ vs 0.8058 | CORE   |
-|---------------|------------|-------------|--------|
-| 2^16          | 0.8052     | −0.0006     | 0.1810 |
-| 2^18 (center) | 0.8037     | −0.0021     | 0.1925 |
-| **2^20**      | **0.8014** | **−0.0044** | 0.1861 |
+| buckets       | val_bpb    | Δ vs 0.8058 | Δ vs center | CORE   |
+|---------------|------------|-------------|-------------|--------|
+| 2^16          | 0.8052     | −0.0006     | +0.0015     | 0.1810 |
+| 2^18 (center) | 0.8037     | −0.0021     | —           | 0.1925 |
+| **2^20**      | **0.8014** | **−0.0044** | **−0.0023** | 0.1861 |
 
 Monotone: more buckets (fewer collisions) → strictly lower val_bpb, no saturation by 2^20,
-largest single step at the top end. This is the dominant lever, and **2^20 (0.8014) is the
-best arm in the whole line** — collisions, not width, bottleneck the pair term.
+largest single step at the top end. This is the dominant lever: 2^20 clears the center by
+**−0.0023** — it genuinely **widens** the win (more than doubling it, −0.0021 → −0.0044 vs
+baseline) — and **2^20 (0.8014) is the best arm in the whole line**. Collisions, not width,
+bottleneck the pair term.
 
-**Best operating point: dim 64 × 2^20 buckets (0.8014, −0.0044).** Every one of the **seven**
-hashed pair-identity arms beats 0.8058, whereas every earlier additive/separable arm tied or
-regressed (proj512 0.8066, prevtok512 0.8099, adapter512 0.8075, multbigram512 0.8072). No
-missing evaluations — all models report val_bpb, val_nats, and CORE.
+**Did any swept arm beat the 0.8037 center?** Yes — **two of the six** swept arms: bucket
+**2^20 (0.8014, −0.0023 vs center)** clearly, and hash-dim **128 (0.8033, −0.0004 vs center)**
+marginally. The other four (d32, d256, d512, b16) sit at or above the center. So the **bucket
+axis widens** the win (−0.0021 → −0.0044 vs baseline), while the **hash-dim axis merely
+reproduces** it (best −0.0025, within the shallow ~0.001 width spread).
+
+**Best operating point: dim 64 × 2^20 buckets (0.8014, −0.0044 vs baseline, −0.0023 vs center).**
+Every one of the **seven** hashed pair-identity arms beats 0.8058, whereas every earlier
+additive/separable arm tied or regressed (proj512 0.8066, prevtok512 0.8099, adapter512 0.8075,
+multbigram512 0.8072). No missing evaluations — all models report val_bpb, val_nats, and CORE.
 
 ## Conclusions
 
@@ -180,5 +189,11 @@ pivot). Next steps:
   (0.178–0.195, within the ±0.02 noise band) — not read. Next embedding-side step (no LR pivot):
   push the unsaturated bucket lever to **2^22 @ dim 64**, then probe the compound **dim 128 ×
   2^20** point; param-matched control and trigram identity follow.
+- **2026-06-26** — Made the **vs-center** comparison explicit in Results/Conclusions (added a
+  `Δ vs center` column to both sweep tables). Of the six swept arms, **only two beat the 0.8037
+  center**: bucket **2^20 (0.8014, −0.0023 vs center)** clearly and hash-dim **128 (0.8033,
+  −0.0004)** marginally. The **bucket axis widens** the win (−0.0021 → −0.0044 vs the 0.8058
+  baseline); the **hash-dim axis merely reproduces** it (within the ~0.001 width spread). No
+  change to the recommended operating point (**dim 64 × 2^20 = 0.8014**) or next steps.
 </content>
 </invoke>
