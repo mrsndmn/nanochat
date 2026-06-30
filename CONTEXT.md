@@ -39,3 +39,37 @@ Mechanism adding a LoRA-style low-rank correction to the output logits
 Distinct from low-dim projection embedding (output side, not input side). Owned by
 `main-low-rank-unembedding`.
 _Avoid:_ conflating with "low-dim projection embedding" — different side of the model.
+
+## Sense
+A latent class `s ∈ {1..K}`; the terminal symbol of the PCFG. The unit the language's
+syntax is defined over and that carries meaning. Never seen directly by the LM.
+_Avoid:_ "word", "token" (those are forms), "concept" (vague).
+
+## Form
+A surface token the LM actually sees. In this experiment the form→token map is the
+**identity** — exactly one form equals exactly one token id (no BPE merging) — so the
+controlled per-form sense-ambiguity is preserved end to end.
+_Avoid:_ "word" (overloaded), "subword"/"BPE token" (a form is never split).
+
+## Polysemy
+A non-injective sense→form map: multiple senses share one form, so a form carries
+residual sense-uncertainty `H(S|W=w) > 0`. The monosemous control is the bijective
+case `H(S|W)=0`. Split into **homonymy** (merged senses have disjoint context
+distributions → context resolves them) vs **overlapping polysemy** (merged senses
+share context mass → residual `H(S|W,C) > 0`).
+_Avoid:_ "ambiguity" alone (covers syntactic uncertainty too); "synonymy" (the inverse:
+many forms → one sense).
+
+## Identity tokenizer
+A trivial whitespace tokenizer mapping each form symbol to exactly one token id (fixed
+vocab, no merges/splits), so the corpus stays a 1:1 form↔token stream. The counterpart
+of nanochat's BPE tokenizer, which this experiment deliberately bypasses.
+_Avoid:_ "tokenizer" unqualified (ambiguous with the BPE tokenizer).
+
+## Context-overlap
+A generator knob in [0,1] controlling how much the *context distributions* of the
+senses merged onto one form coincide. `0` = pure **homonymy** (merged senses occur in
+disjoint contexts → context fully disambiguates them); `partial` = the senses share
+context mass → residual `H(S|W,C) > 0` that context cannot remove. Distinct from the
+amount of polysemy `H(S|W)`: overlap is about *resolvability*, not quantity.
+_Avoid:_ "ambiguity overlap", conflating it with the `H(S|W)` level.
