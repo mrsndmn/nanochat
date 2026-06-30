@@ -53,6 +53,36 @@ def _class_sizes(num_senses: int) -> dict:
     return {c: sizes[c] for c in POS_CLASSES}
 
 
+# Heavy shared inputs for parallel condition builds. Forked Pool workers inherit these
+# copy-on-write, so the multi-GB sense stream is never pickled to children. Populated in the
+# parent immediately before the (fork-context) Pool is created.
+_COND_STATE = {}
+
+
+def _build_one(cond, cond_dir, cfg, pcfg, inventory, sense_docs, sense_prob,
+               probe_sense_docs, shard_chars, seed):
+    """Build + write one condition; return a small summary (never returns the big objects)."""
+    t1 = time.time()
+    documents, smap, metadata = build_condition(cfg, pcfg, inventory, sense_docs, sense_prob, cond)
+    paths = write_parquet_shards(documents, cond_dir, shard_chars=shard_chars)
+    write_vocab(smap, cond_dir)
+    write_metadata(metadata, cond_dir)
+    if probe_sense_docs is not None:
+        write_probe_jsonl(render_documents_with_senses(probe_sense_docs, smap, seed=seed), cond_dir)
+    hsw = metadata["h_s_given_w"]
+    return {"slug": cond.slug, "vocab_size": smap.vocab_size, "target": hsw["target_bits"],
+            "measured": hsw["measured_bits"], "within_tol": hsw["within_tolerance"],
+            "shards": len(paths), "secs": time.time() - t1}
+
+
+def _build_condition_worker(task):
+    """Pool worker: read the fork-inherited shared state and build one condition."""
+    cond, cond_dir, shard_chars, seed = task
+    s = _COND_STATE
+    return _build_one(cond, cond_dir, s["cfg"], s["pcfg"], s["inventory"], s["sense_docs"],
+                      s["sense_prob"], s["probe_sense_docs"], shard_chars, seed)
+
+
 def build_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate polysemy×context synthetic corpora.")
     p.add_argument("--out-dir", type=str, default=None,
@@ -70,6 +100,10 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=_default_workers(),
                    help="parallel processes for sense-stream sampling (the dominant cost). "
                         "Deterministic given (seed, num_workers); 1 = original single-process behavior.")
+    p.add_argument("--condition-workers", type=int, default=len(default_conditions()),
+                   help="parallel processes for the per-condition build (render + stats + write). "
+                        "Each holds ~3x the per-condition corpus in RAM, so lower it for very large "
+                        "--num-tokens; 1 = serial.")
     p.add_argument("--dry", action="store_true", help="print the plan and exit without writing")
     p.add_argument("--force", action="store_true", help="overwrite a condition dir if it already exists")
     return p.parse_args()
@@ -96,7 +130,7 @@ def main() -> int:
     print(f"num_senses K  = {args.num_senses}  (class sizes: {class_sizes})")
     print(f"num_tokens    ~ {args.num_tokens:,}")
     print(f"seed          = {args.seed}")
-    print(f"num_workers   = {args.num_workers}")
+    print(f"num_workers   = {args.num_workers} (sampling) | {args.condition_workers} (conditions)")
     print(f"conditions    = {[c.slug for c in conditions]}")
     if args.dry:
         print("[DRY] no data written.")
@@ -126,25 +160,42 @@ def main() -> int:
         )[: args.probe_docs]
         print(f"Probe held-out stream: {len(probe_sense_docs):,} docs (sense-labeled)")
 
-    vocab_sizes = set()
+    # Which conditions still need building (idempotency / --force)?
+    pending = []
     for cond in conditions:
         cond_dir = os.path.join(out_root, cond.slug)
         if os.path.isdir(cond_dir) and os.listdir(cond_dir) and not args.force:
             print(f"Skipping {cond.slug}: {cond_dir} already exists (use --force).")
             continue
-        t1 = time.time()
-        documents, smap, metadata = build_condition(cfg, pcfg, inventory, sense_docs, sense_prob, cond)
-        paths = write_parquet_shards(documents, cond_dir, shard_chars=args.shard_chars)
-        write_vocab(smap, cond_dir)
-        write_metadata(metadata, cond_dir)
-        if probe_sense_docs is not None:
-            probe_records = render_documents_with_senses(probe_sense_docs, smap, seed=args.seed)
-            write_probe_jsonl(probe_records, cond_dir)
-        vocab_sizes.add(smap.vocab_size)
-        hsw = metadata["h_s_given_w"]
-        ok = "ok" if hsw["within_tolerance"] else "OUT-OF-TOL"
-        print(f"  [{cond.slug}] |V|={smap.vocab_size} H(S|W) target={hsw['target_bits']:.2f} "
-              f"measured={hsw['measured_bits']:.3f} ({ok}) | {len(paths)} shards | {time.time()-t1:.1f}s")
+        pending.append((cond, cond_dir))
+
+    cond_workers = max(1, min(args.condition_workers, len(pending)))
+    t_build = time.time()
+    summaries = []
+    if pending and cond_workers > 1:
+        # Build conditions in parallel. fork context so workers inherit the (multi-GB) shared
+        # sense stream copy-on-write instead of pickling it; only the small task tuples are sent.
+        from multiprocessing import get_context
+        _COND_STATE.update(cfg=cfg, pcfg=pcfg, inventory=inventory, sense_docs=sense_docs,
+                           sense_prob=sense_prob, probe_sense_docs=probe_sense_docs)
+        tasks = [(cond, cond_dir, args.shard_chars, args.seed) for cond, cond_dir in pending]
+        print(f"Building {len(pending)} conditions with {cond_workers} parallel workers...")
+        with get_context("fork").Pool(cond_workers) as pool:
+            summaries = pool.map(_build_condition_worker, tasks)
+        _COND_STATE.clear()
+    else:
+        for cond, cond_dir in pending:
+            summaries.append(_build_one(cond, cond_dir, cfg, pcfg, inventory, sense_docs,
+                                        sense_prob, probe_sense_docs, args.shard_chars, args.seed))
+    if pending:
+        print(f"Built {len(pending)} conditions in {time.time()-t_build:.1f}s")
+
+    vocab_sizes = set()
+    for s in summaries:
+        vocab_sizes.add(s["vocab_size"])
+        ok = "ok" if s["within_tol"] else "OUT-OF-TOL"
+        print(f"  [{s['slug']}] |V|={s['vocab_size']} H(S|W) target={s['target']:.2f} "
+              f"measured={s['measured']:.3f} ({ok}) | {s['shards']} shards | {s['secs']:.1f}s")
 
     if len(vocab_sizes) > 1:
         print(f"WARNING: |V| differs across generated conditions: {sorted(vocab_sizes)}")
