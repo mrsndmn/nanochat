@@ -90,9 +90,14 @@ def test_polysemy_configs_grid(run_training):
         assert "--tokenizer identity" in a
         assert "--window-pattern L" in a            # full attention: required for the L sweep
         assert "--core-metric-every -1" in a        # CORE meaningless for synthetic vocab
-        assert "--total-batch-size 32768" in a      # held constant across L
+        assert "--total-batch-size 32768" in a      # global batch held constant across L
+        assert "--eval-every 2500" in a
+        assert "--eval-tokens" not in a             # left at base default (not overridden)
         L = int(re.search(r"--max-seq-len (\d+)", a).group(1))
         assert L in run_training.POLYSEMY_SEQ_LENS
+        # per-L device batch gives grad-accum == 1 at the fixed 32768-token global batch on 4 GPUs
+        dbs = int(re.search(r"--device-batch-size (\d+)", a).group(1))
+        assert dbs * L * 4 == 32768, f"grad-accum != 1 for L={L} (dbs={dbs})"
         slug = re.match(r"^poly_(.+)_L\d+$", c["model_tag"]).group(1)
         assert slug in slugs
         assert f"--data-dir {run_training.POLYSEMY_DATA_ROOT}/{slug}" in a

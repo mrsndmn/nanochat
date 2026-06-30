@@ -36,10 +36,10 @@ def _default_workers() -> int:
     return max(1, min(32, n))
 
 from nanochat.polysemy import (
-    GeneratorConfig, POS_CLASSES, PROBE_SEED_OFFSET, build_default_pcfg, build_sense_inventory,
-    generate_sense_corpus, _sense_probabilities, build_condition, default_conditions,
-    render_documents_with_senses, write_parquet_shards, write_vocab, write_metadata,
-    write_probe_jsonl,
+    GeneratorConfig, POS_CLASSES, PROBE_SEED_OFFSET, build_default_pcfg, build_long_pcfg,
+    build_sense_inventory, generate_sense_corpus, _sense_probabilities, build_condition,
+    default_conditions, render_documents_with_senses, write_parquet_shards, write_vocab,
+    write_metadata, write_probe_jsonl,
 )
 
 
@@ -91,7 +91,13 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--num-tokens", type=int, default=10_000_000, help="approx sense tokens to generate")
     p.add_argument("--seed", type=int, default=0, help="seed for the whole run (deterministic)")
     p.add_argument("--zipf-exponent", type=float, default=1.0, help="within-class Zipf exponent")
-    p.add_argument("--max-depth", type=int, default=5, help="PCFG recursion depth cap")
+    p.add_argument("--grammar", type=str, default="default", choices=["default", "long"],
+                   help="default = short clauses (~6-40 tokens); long = center-embedding for long "
+                        "documents with long-range structure (use with large --max-depth/--min-len/--max-len)")
+    p.add_argument("--continuation", type=float, default=0.9993,
+                   help="long-grammar recursion prob; mean doc length ~4*c/(1-c), capped by --max-depth. "
+                        "Ignored for --grammar default.")
+    p.add_argument("--max-depth", type=int, default=5, help="PCFG recursion depth cap (long grammar: bounds doc length to ~4*max_depth)")
     p.add_argument("--min-len", type=int, default=8, help="min derivation length (senses)")
     p.add_argument("--max-len", type=int, default=40, help="max derivation length (senses)")
     p.add_argument("--tolerance", type=float, default=0.05, help="H(S|W) target tolerance (bits)")
@@ -122,13 +128,17 @@ def main() -> int:
         class_sizes=class_sizes, num_tokens=args.num_tokens, seed=args.seed,
         zipf_exponent=args.zipf_exponent, max_depth=args.max_depth,
         min_len=args.min_len, max_len=args.max_len, tolerance=args.tolerance,
-        num_workers=args.num_workers,
+        num_workers=args.num_workers, grammar=args.grammar, continuation=args.continuation,
     )
     conditions = default_conditions()
 
+    grammar_desc = (f"long (center-embedding, continuation={args.continuation})"
+                    if args.grammar == "long" else "default (short clauses)")
     print(f"out_root      = {out_root}")
     print(f"num_senses K  = {args.num_senses}  (class sizes: {class_sizes})")
     print(f"num_tokens    ~ {args.num_tokens:,}")
+    print(f"grammar       = {grammar_desc}")
+    print(f"len bounds    = depth_cap={args.max_depth}, len in [{args.min_len},{args.max_len}]")
     print(f"seed          = {args.seed}")
     print(f"num_workers   = {args.num_workers} (sampling) | {args.condition_workers} (conditions)")
     print(f"conditions    = {[c.slug for c in conditions]}")
@@ -136,7 +146,7 @@ def main() -> int:
         print("[DRY] no data written.")
         return 0
 
-    pcfg = build_default_pcfg()
+    pcfg = build_long_pcfg(args.continuation) if args.grammar == "long" else build_default_pcfg()
     inventory = build_sense_inventory(class_sizes, zipf_exponent=args.zipf_exponent)
 
     print("Generating the shared sense stream (syntax held constant across conditions)...")

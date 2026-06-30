@@ -18,11 +18,11 @@ import os
 import pytest
 
 from nanochat.polysemy import (
-    GeneratorConfig, IdentityVocab, build_condition, build_default_pcfg,
-    build_sense_form_map, build_sense_inventory, corpus_hsw, default_conditions,
+    GeneratorConfig, IdentityVocab, analytic_pcfg_entropy, build_condition, build_default_pcfg,
+    build_long_pcfg, build_sense_form_map, build_sense_inventory, corpus_hsw, default_conditions,
     generate_sense_corpus, render_documents, render_documents_with_senses,
     write_metadata, write_parquet_shards, write_probe_jsonl, write_vocab,
-    _sense_probabilities,
+    _sample_pos_sequence, _sense_probabilities,
 )
 
 POS_FRACS = {"N": 0.45, "V": 0.30, "DET": 0.10, "P": 0.15}
@@ -121,6 +121,44 @@ def test_form_token_roundtrip_identity(small_run):
         # every emitted symbol is in the vocab (1:1 form<->token)
         for tok in doc.split():
             assert tok in vocab.stoi
+
+
+def test_long_grammar_is_subcritical_and_produces_long_docs():
+    import numpy as np
+    inv = build_sense_inventory(_class_sizes(64))
+    pcfg = build_long_pcfg(0.99)  # mean ~4*0.99/0.01 ~ 396 tokens, capped by max_depth
+    # subcritical: the analytic PCFG entropy (needs (I - M)^-1) must exist
+    ape = analytic_pcfg_entropy(pcfg, inv)
+    assert ape is not None and ape["bits_per_sense"] > 0
+    # documents are long (vs the ~6-token default grammar) and use all four POS classes
+    rng = np.random.default_rng(0)
+    seqs = [_sample_pos_sequence(pcfg, rng, 500) for _ in range(200)]
+    assert np.mean([len(s) for s in seqs]) > 100
+    classes_seen = {c for s in seqs for c in s}
+    assert classes_seen == {"N", "V", "DET", "P"}
+    # higher continuation => longer documents
+    short = np.mean([len(_sample_pos_sequence(build_long_pcfg(0.95), rng, 500)) for _ in range(200)])
+    long = np.mean([len(_sample_pos_sequence(build_long_pcfg(0.99), rng, 500)) for _ in range(200)])
+    assert long > short
+
+
+def test_long_grammar_hits_hsw_target_within_tolerance():
+    # the homonymy / overlap / H(S|W) machinery must work unchanged on the long grammar
+    k = 96
+    cs = _class_sizes(k)
+    cfg = GeneratorConfig(class_sizes=cs, num_tokens=80_000, seed=0, grammar="long",
+                          continuation=0.99, max_depth=400, min_len=64, max_len=2000,
+                          tolerance=0.05, hm_max_tokens=40_000)
+    pcfg = build_long_pcfg(cfg.continuation)
+    inv = build_sense_inventory(cs)
+    docs = generate_sense_corpus(pcfg, inv, num_tokens=cfg.num_tokens, max_depth=cfg.max_depth,
+                                 min_len=cfg.min_len, max_len=cfg.max_len, seed=cfg.seed)
+    sp = _sense_probabilities(docs, inv.num_senses)
+    for cond in default_conditions():
+        _, smap, md = build_condition(cfg, pcfg, inv, docs, sp, cond)
+        h = md["h_s_given_w"]
+        assert smap.vocab_size == inv.num_senses
+        assert abs(h["measured_bits"] - h["target_bits"]) <= cfg.tolerance
 
 
 def test_parallel_generation_is_deterministic_and_honors_budget():

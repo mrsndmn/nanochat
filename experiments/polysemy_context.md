@@ -65,3 +65,11 @@ arms), then `scripts.analyze_polysemy` + `scripts.probe_polysemy` to read off wh
   `analyze_polysemy`/`probe_polysemy` scripts and the generator's `probe.jsonl` export. Made the
   generator's broken-pandas blocker coexist with `torch._dynamo`; made `nanochat.dataset`'s
   `requests` import lazy. ADR 0005 added. All tests green (82 passed).
+- 2026-07-01: Parallelized generation (sense-stream sampling + per-condition build) — ~8× faster
+  (400M in ~27 min). Then pivoted to a **long-document regime** so the context sweep is meaningful:
+  the original PCFG caps at ~6-token docs (raising depth does nothing), so a long-L sweep would
+  saturate. Added `build_long_pcfg` — *linear center-embedding* (subcritical, analytic entropy
+  preserved) whose nesting depth/phase is a genuine long-range dependency, producing ~3–4k-token
+  documents (continuation knob). Reworked the sweep to **L ∈ {512,1024,2048}** at a constant 32768
+  global batch with per-L device batch 16/8/4 (grad-accum=1, identical optimization steps),
+  `--eval-every 2500`, no `--eval-tokens` override. Validated H(S|W) within ±0.05 on long docs.

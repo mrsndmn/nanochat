@@ -145,9 +145,39 @@ def build_default_pcfg() -> PCFG:
     return PCFG(start="S", rules=rules)
 
 
+def build_long_pcfg(continuation: float = 0.9987) -> PCFG:
+    """Center-embedding grammar for LONG documents with genuine long-range structure.
+
+        S  -> CL
+        CL -> DET N P CL V     (prob = continuation)     # nest: opening "DET N P", closing "V"
+            | DET N V          (prob = 1 - continuation)  # innermost base clause
+
+    This is *linear* (branching-1) center-embedding, so it is subcritical for
+    ``continuation`` < 1 (the analytic PCFG entropy / fundamental matrix still exists, unlike
+    a branching-recursive grammar which explodes). A derivation with ``n`` recursions has
+    length ``4*n + 3`` with ``n ~ Geometric(continuation)``, so the mean length is
+    ``~4*continuation/(1-continuation)`` — e.g. continuation=0.9987 -> ~3000 tokens — and the
+    recursion-depth cap (``max_depth`` at sampling time) bounds the long tail.
+
+    Why this shape: the nesting depth / phase at any position depends on the ENTIRE prefix
+    (each opening "DET N P" must be matched by a later closing "V"), so a token's POS slot —
+    and therefore the resolution of a cross-class homonym sitting on that slot — is a
+    long-range function of the context. That is exactly what makes ``gap(L)`` able to vary
+    across long context lengths instead of saturating once a (short) document fits.
+    """
+    c = float(continuation)
+    assert 0.0 < c < 1.0, "continuation must be in (0,1) to stay subcritical"
+    return PCFG(start="S", rules=[
+        Rule("S", ("CL",), 1.0),
+        Rule("CL", ("DET", "N", "P", "CL", "V"), c),
+        Rule("CL", ("DET", "N", "V"), 1.0 - c),
+    ])
+
+
 # Rules that can grow the derivation by re-introducing a nonterminal (forbidden at the
-# recursion-depth cap so sampling always terminates).
-_RECURSIVE_RHS = {("NP", "PP"), ("V", "NP", "PP")}
+# recursion-depth cap so sampling always terminates). Includes the long grammar's
+# center-embedding production so the depth cap bounds document length.
+_RECURSIVE_RHS = {("NP", "PP"), ("V", "NP", "PP"), ("DET", "N", "P", "CL", "V")}
 
 
 # -----------------------------------------------------------------------------
@@ -746,6 +776,8 @@ class GeneratorConfig:
     hm_ms: Tuple[int, ...] = (1, 2, 3)
     hm_max_tokens: int = 2_000_000
     num_workers: int = 1  # parallel sampling workers; recorded so the corpus is reproducible
+    grammar: str = "default"      # "default" (short clauses) | "long" (center-embedding, long-range)
+    continuation: float = 0.9987  # long-grammar recursion prob (sets doc length); ignored for "default"
 
     @property
     def num_senses(self) -> int:

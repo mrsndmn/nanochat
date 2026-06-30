@@ -29,8 +29,15 @@ from typing import List
 POLYSEMY_DATA_ROOT = "/workspace-SR004.nfs2/d.tarasov/nanochat-artifacts/base_data_polysemy"
 
 # The context-length sweep L (= model sequence length / dataloader row capacity-1). The
-# experiment hypothesis is gap(L) = PPL_poly(L) - PPL_mono(L) -> 0 as L grows.
-POLYSEMY_SEQ_LENS = (8, 32, 128, 512)
+# experiment hypothesis is gap(L) = PPL_poly(L) - PPL_mono(L) -> 0 as L grows. The corpus is
+# generated with long center-embedding documents (median ~3-4k tokens), so every L here
+# truncates the typical document -> more context = more of the same derivation's prefix.
+POLYSEMY_SEQ_LENS = (512, 1024, 2048)
+
+# Per-L device (micro) batch size chosen so grad-accum == 1 at the fixed 32768-token global
+# batch on a 4-GPU node: device_batch_size * L * 4 == 32768. Keeps the global batch (hence
+# the optimization trajectory and step count) identical across L while maximizing throughput.
+POLYSEMY_DEVICE_BATCH_BY_L = {512: 16, 1024: 8, 2048: 4}
 
 
 def polysemy_context_experiments(data_root: str = POLYSEMY_DATA_ROOT) -> list[dict]:
@@ -52,12 +59,15 @@ def polysemy_context_experiments(data_root: str = POLYSEMY_DATA_ROOT) -> list[di
       gap reflects context-resolvability, not under-parameterization);
     - --window-pattern L: FULL attention. A sliding window would cap the usable context and
       confound the very axis we sweep, so it is disabled;
-    - --total-batch-size 32768 held constant across L for comparability (it divides
-      device_batch_size*L*4gpu for every L in the sweep);
+    - --total-batch-size 32768 held constant across L; per-L --device-batch-size (16/8/4 for
+      512/1024/2048) gives grad-accum == 1 (optimized throughput) while keeping the global
+      batch — and hence the optimization trajectory and the 10k optimization steps — identical
+      across all arms;
     - 10k steps, single seed (project convention: one run per config, no multi-seed fan-out);
-    - CORE + sampling disabled (English ICL / prompts are meaningless for a synthetic vocab);
-      a light val-bpb eval stays on so the checkpoint meta records val loss / PPL for the
-      analysis, which also runs a final controlled BPB via run_evaluation.py --eval bpb.
+    - --eval-every 2500 (5 in-training val evals) so the checkpoint meta records val loss / PPL
+      for the analysis; --eval-tokens left at the base default (no override); a final controlled
+      BPB also comes from run_evaluation.py --eval bpb;
+    - CORE + sampling disabled (English ICL / prompts are meaningless for a synthetic vocab).
     """
     experiment_slug = "polysemy-context"
     num_gpus = 4
@@ -74,10 +84,8 @@ def polysemy_context_experiments(data_root: str = POLYSEMY_DATA_ROOT) -> list[di
         "--window-pattern L",            # full attention: the context-length sweep must not be capped by a window
         "--tokenizer identity",
         "--num-iterations 10000",
-        "--total-batch-size 32768",      # held constant across L (divides device_bs*L*num_gpus for all L)
-        "--device-batch-size 16",
-        "--eval-every 1000",             # light in-training val so checkpoint meta carries val loss / PPL
-        "--eval-tokens 262144",
+        "--total-batch-size 32768",      # held constant across L (global batch / optimization steps identical)
+        "--eval-every 2500",             # 5 in-training val evals -> checkpoint meta carries val loss / PPL
         "--core-metric-every -1",        # CORE = English ICL: meaningless for the synthetic vocab
         "--sample-every -1",             # sample prompts are English: meaningless here
         f"--seed {seed}",
@@ -87,7 +95,10 @@ def polysemy_context_experiments(data_root: str = POLYSEMY_DATA_ROOT) -> list[di
     for cond in conditions:
         data_dir = f"{data_root}/{cond.slug}"
         for seq_len in POLYSEMY_SEQ_LENS:
-            args_parts = shared_args + [f"--max-seq-len {seq_len}", f"--data-dir {data_dir}"]
+            device_bs = POLYSEMY_DEVICE_BATCH_BY_L[seq_len]  # grad-accum == 1 at the fixed global batch
+            args_parts = shared_args + [
+                f"--max-seq-len {seq_len}", f"--device-batch-size {device_bs}", f"--data-dir {data_dir}",
+            ]
             args_str = " ".join(args_parts).strip()
             cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
             model_tag = f"poly_{cond.slug}_L{seq_len}"
