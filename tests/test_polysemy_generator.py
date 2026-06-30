@@ -123,6 +123,21 @@ def test_form_token_roundtrip_identity(small_run):
             assert tok in vocab.stoi
 
 
+def test_parallel_generation_is_deterministic_and_honors_budget():
+    pcfg = build_default_pcfg()
+    inv = build_sense_inventory(_class_sizes(64))
+    kw = dict(num_tokens=30_000, seed=0, min_len=6, max_len=30)
+    a = generate_sense_corpus(pcfg, inv, num_workers=4, **kw)
+    b = generate_sense_corpus(pcfg, inv, num_workers=4, **kw)
+    assert a == b, "parallel generation must be deterministic for fixed (seed, num_workers)"
+    assert sum(len(d) for d in a) >= kw["num_tokens"]  # budget honored
+    # a different worker count yields a different (but still valid) stream
+    c = generate_sense_corpus(pcfg, inv, num_workers=2, **kw)
+    assert a != c
+    # all docs respect the length filter regardless of worker count
+    assert all(6 <= len(d) <= 30 for d in a)
+
+
 def test_generation_is_deterministic(small_run):
     cfg, pcfg, inventory, sense_docs, sense_prob = small_run
     a = render_documents(sense_docs, build_sense_form_map(inventory, sense_prob, target_hsw=0.5,

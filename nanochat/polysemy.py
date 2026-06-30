@@ -229,17 +229,8 @@ def _sample_senses_for_pos(pos_seq: Sequence[str], inventory: SenseInventory,
     return senses
 
 
-def generate_sense_corpus(pcfg: PCFG, inventory: SenseInventory, *, num_tokens: int,
-                          max_depth: int = 5, min_len: int = 4, max_len: int = 60,
-                          seed: int = 0) -> List[List[int]]:
-    """Generate documents (each a list of sense ids) until ~num_tokens senses are produced.
-
-    Each document is one PCFG derivation. Documents whose length falls outside
-    [min_len, max_len] are rejected and resampled (a soft length control). The sense
-    stream is the *syntactic* layer and is reused across all lexical conditions.
-    """
-    rng = np.random.default_rng(seed)
-    # Precompute normalized cumulative Zipf distributions per class.
+def _build_class_cum(inventory: SenseInventory) -> Dict[str, np.ndarray]:
+    """Normalized cumulative Zipf distribution per POS class (for fast sense sampling)."""
     class_cum: Dict[str, np.ndarray] = {}
     for cls, ids in inventory.senses_by_class.items():
         if not ids:
@@ -247,7 +238,13 @@ def generate_sense_corpus(pcfg: PCFG, inventory: SenseInventory, *, num_tokens: 
         w = np.array([inventory.within_class_weight[s] for s in ids], dtype=np.float64)
         w = w / w.sum()
         class_cum[cls] = np.cumsum(w)
+    return class_cum
 
+
+def _sample_docs_until(pcfg: PCFG, inventory: SenseInventory, class_cum: Dict[str, np.ndarray],
+                       rng: np.random.Generator, num_tokens: int, max_depth: int,
+                       min_len: int, max_len: int) -> List[List[int]]:
+    """Sample derivations (length-filtered) until >= num_tokens sense tokens are produced."""
     docs: List[List[int]] = []
     total = 0
     while total < num_tokens:
@@ -258,6 +255,54 @@ def generate_sense_corpus(pcfg: PCFG, inventory: SenseInventory, *, num_tokens: 
         docs.append(senses)
         total += len(senses)
     return docs
+
+
+def _sense_chunk_worker(args):
+    """Pool worker: generate one chunk of the sense stream from its own seeded RNG.
+
+    Module-level (picklable). Each worker owns an independent np.random stream (spawned from
+    the base seed via SeedSequence), so the result is deterministic given (seed, num_workers).
+    """
+    pcfg, inventory, num_tokens, max_depth, min_len, max_len, seed_seq = args
+    rng = np.random.default_rng(seed_seq)
+    class_cum = _build_class_cum(inventory)
+    return _sample_docs_until(pcfg, inventory, class_cum, rng, num_tokens, max_depth, min_len, max_len)
+
+
+def generate_sense_corpus(pcfg: PCFG, inventory: SenseInventory, *, num_tokens: int,
+                          max_depth: int = 5, min_len: int = 4, max_len: int = 60,
+                          seed: int = 0, num_workers: int = 1) -> List[List[int]]:
+    """Generate documents (each a list of sense ids) until ~num_tokens senses are produced.
+
+    Each document is one PCFG derivation. Documents whose length falls outside
+    [min_len, max_len] are rejected and resampled (a soft length control). The sense
+    stream is the *syntactic* layer and is reused across all lexical conditions.
+
+    ``num_workers`` > 1 parallelizes the (embarrassingly parallel) document sampling across
+    processes — the sampling loop is pure-Python and the dominant cost at large scale. The
+    token budget is split evenly across workers, each driven by an independent RNG spawned
+    from ``seed`` via ``SeedSequence``, and the per-worker chunks are concatenated in worker
+    order. The result is therefore deterministic given ``(seed, num_workers)`` — but, because
+    the seeding scheme differs, NOT identical to the single-worker stream or to a run with a
+    different worker count. ``num_workers=1`` keeps the original single-process behavior
+    exactly (so existing single-worker corpora reproduce bit-for-bit).
+    """
+    if num_workers and num_workers > 1:
+        from multiprocessing import Pool
+        child_seqs = np.random.SeedSequence(seed).spawn(num_workers)
+        per = num_tokens // num_workers
+        budgets = [per] * num_workers
+        budgets[0] += num_tokens - per * num_workers  # remainder -> worker 0
+        tasks = [(pcfg, inventory, budgets[i], max_depth, min_len, max_len, child_seqs[i])
+                 for i in range(num_workers)]
+        with Pool(num_workers) as pool:
+            chunks = pool.map(_sense_chunk_worker, tasks)
+        # concatenate in deterministic worker order (independent of completion order)
+        return [doc for chunk in chunks for doc in chunk]
+
+    rng = np.random.default_rng(seed)
+    class_cum = _build_class_cum(inventory)
+    return _sample_docs_until(pcfg, inventory, class_cum, rng, num_tokens, max_depth, min_len, max_len)
 
 
 # -----------------------------------------------------------------------------
@@ -700,6 +745,7 @@ class GeneratorConfig:
     tolerance: float = 0.05
     hm_ms: Tuple[int, ...] = (1, 2, 3)
     hm_max_tokens: int = 2_000_000
+    num_workers: int = 1  # parallel sampling workers; recorded so the corpus is reproducible
 
     @property
     def num_senses(self) -> int:

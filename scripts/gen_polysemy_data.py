@@ -26,6 +26,15 @@ import os
 import sys
 import time
 
+
+def _default_workers() -> int:
+    """A sensible default worker count: usable CPUs, capped (diminishing returns + overhead)."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n = os.cpu_count() or 1
+    return max(1, min(32, n))
+
 from nanochat.polysemy import (
     GeneratorConfig, POS_CLASSES, PROBE_SEED_OFFSET, build_default_pcfg, build_sense_inventory,
     generate_sense_corpus, _sense_probabilities, build_condition, default_conditions,
@@ -58,6 +67,9 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--tolerance", type=float, default=0.05, help="H(S|W) target tolerance (bits)")
     p.add_argument("--shard-chars", type=int, default=50_000_000, help="approx chars per parquet shard")
     p.add_argument("--probe-docs", type=int, default=2000, help="held-out sense-labeled docs per condition for the representation probe (0 = skip)")
+    p.add_argument("--num-workers", type=int, default=_default_workers(),
+                   help="parallel processes for sense-stream sampling (the dominant cost). "
+                        "Deterministic given (seed, num_workers); 1 = original single-process behavior.")
     p.add_argument("--dry", action="store_true", help="print the plan and exit without writing")
     p.add_argument("--force", action="store_true", help="overwrite a condition dir if it already exists")
     return p.parse_args()
@@ -76,6 +88,7 @@ def main() -> int:
         class_sizes=class_sizes, num_tokens=args.num_tokens, seed=args.seed,
         zipf_exponent=args.zipf_exponent, max_depth=args.max_depth,
         min_len=args.min_len, max_len=args.max_len, tolerance=args.tolerance,
+        num_workers=args.num_workers,
     )
     conditions = default_conditions()
 
@@ -83,6 +96,7 @@ def main() -> int:
     print(f"num_senses K  = {args.num_senses}  (class sizes: {class_sizes})")
     print(f"num_tokens    ~ {args.num_tokens:,}")
     print(f"seed          = {args.seed}")
+    print(f"num_workers   = {args.num_workers}")
     print(f"conditions    = {[c.slug for c in conditions]}")
     if args.dry:
         print("[DRY] no data written.")
@@ -95,7 +109,7 @@ def main() -> int:
     t0 = time.time()
     sense_docs = generate_sense_corpus(
         pcfg, inventory, num_tokens=args.num_tokens, max_depth=args.max_depth,
-        min_len=args.min_len, max_len=args.max_len, seed=args.seed,
+        min_len=args.min_len, max_len=args.max_len, seed=args.seed, num_workers=args.num_workers,
     )
     sense_prob = _sense_probabilities(sense_docs, inventory.num_senses)
     n_sense_tokens = sum(len(d) for d in sense_docs)
@@ -108,7 +122,7 @@ def main() -> int:
         probe_sense_docs = generate_sense_corpus(
             pcfg, inventory, num_tokens=args.probe_docs * args.max_len,
             max_depth=args.max_depth, min_len=args.min_len, max_len=args.max_len,
-            seed=args.seed + PROBE_SEED_OFFSET,
+            seed=args.seed + PROBE_SEED_OFFSET, num_workers=args.num_workers,
         )[: args.probe_docs]
         print(f"Probe held-out stream: {len(probe_sense_docs):,} docs (sense-labeled)")
 
