@@ -131,9 +131,18 @@ def build_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    from mls.manager.job.utils import get_in_progress_jobs, training_job_api_from_profile
-
     args = build_args()
+
+    # The MLS SDK is only needed to actually submit; --dry previews offline (and stays usable
+    # in envs where the SDK's deps are unavailable). Defer the import + the client / in-progress
+    # query to real launches.
+    client = None
+    extra_options = {"region": "<dry>"}
+    in_progress_job_descs = set()
+    if not args.dry:
+        from mls.manager.job.utils import get_in_progress_jobs, training_job_api_from_profile
+        client, extra_options = training_job_api_from_profile(args.profile)
+        in_progress_job_descs = {job.get("job_desc", "") for job in get_in_progress_jobs()}
 
     workdir = os.getcwd()
     workdir = workdir.replace('/mnt/virtual_ai0001053-00054_SR004-nfs2/', '/workspace-SR004.nfs2/')
@@ -155,13 +164,8 @@ if __name__ == "__main__":
     print(f"workdir={workdir}")
     print(f"base_dir_job={base_dir_job}")
 
-    client, extra_options = training_job_api_from_profile(args.profile)
-
     author_name = args.author_name
     telegram_nick = args.telegram_nick
-
-    in_progress_jobs = get_in_progress_jobs()
-    in_progress_job_descs = {job.get("job_desc", "") for job in in_progress_jobs}
 
     jobs_planned = 0
     jobs_launched = 0
