@@ -73,3 +73,19 @@ disjoint contexts → context fully disambiguates them); `partial` = the senses 
 context mass → residual `H(S|W,C) > 0` that context cannot remove. Distinct from the
 amount of polysemy `H(S|W)`: overlap is about *resolvability*, not quantity.
 _Avoid:_ "ambiguity overlap", conflating it with the `H(S|W)` level.
+
+## gap(L)
+The headline readout: `gap(L) = PPL_poly(L) − PPL_mono(L)`, the extra next-form
+perplexity a polysemous condition pays over the monosemous baseline at context length
+`L` (model sequence length). The hypothesis is `gap(L) → 0` as `L` grows for homonymy
+(context resolves the sense) and plateaus above 0 for overlapping polysemy. Also tracked
+in bits/form (`gap_bpc`). Computed by `nanochat/polysemy_analysis.py`.
+_Avoid:_ "perplexity gap" unqualified (always relative to the monosemous baseline at the
+same `L`); confusing it with `H(S|W)` (the injected ambiguity, not the measured penalty).
+
+## BPC (bits per form)
+The per-token cross-entropy in bits (`loss / ln2`). Under the identity tokenizer one form
+= one token = one "byte", so BPC equals the trainer's bpb and is directly comparable to
+the analytic source-entropy floor (PCFG bits/sense). _Avoid:_ "bits per byte" (true only
+because each form is defined to be 1 byte here) and "bits per character" in the
+natural-text sense.

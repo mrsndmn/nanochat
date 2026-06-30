@@ -53,6 +53,9 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--num-train-shards", type=int, default=-1, help="cap on number of train shards used (-1 = all available). Pins the epoch/data budget so a run can be kept within a single epoch (no data repetition); val split always uses the last shard")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Data / tokenizer (polysemy experiment uses an identity tokenizer over a synthetic corpus)
+parser.add_argument("--data-dir", type=str, default=None, help="override parquet data dir (None = default ClimbMix). For the polysemy experiment, a condition dir under base_data_polysemy/")
+parser.add_argument("--tokenizer", type=str, default="bpe", choices=["bpe", "identity"], help="bpe = nanochat BPE tokenizer; identity = 1-form=1-id whitespace tokenizer over --data-dir/vocab.json (polysemy experiment)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -133,9 +136,18 @@ else:
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
-# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+# Tokenizer will be useful for evaluation and also we need the vocab size to init the model.
+# Two paths: the default BPE tokenizer, or the identity tokenizer for the polysemy
+# experiment (1 form = 1 token id over a synthetic corpus; see nanochat/identity_tokenizer.py).
+if args.tokenizer == "identity":
+    assert args.data_dir is not None, "--tokenizer identity requires --data-dir (holds vocab.json)"
+    from nanochat.identity_tokenizer import get_identity_tokenizer
+    tokenizer = get_identity_tokenizer(args.data_dir)
+    token_bytes = tokenizer.token_bytes(device=device)
+    print0(f"Identity tokenizer from {args.data_dir} ({tokenizer.num_forms} forms + {len(tokenizer.special_tokens)} special)")
+else:
+    tokenizer = get_tokenizer()
+    token_bytes = get_token_bytes(device=device)
 real_vocab_size = tokenizer.get_vocab_size()
 
 vocab_size = real_vocab_size
@@ -363,8 +375,8 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, num_train_shards=args.num_train_shards)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, num_train_shards=args.num_train_shards, data_dir=args.data_dir)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=args.data_dir)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------

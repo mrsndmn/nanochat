@@ -74,13 +74,17 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     return model_data, optimizer_data, meta_data
 
 
-def build_model(checkpoint_dir, step, device, phase):
+def build_model(checkpoint_dir, step, device, phase, tokenizer=None):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
     Returns:
     - base model - uncompiled, not wrapped in DDP
     - tokenizer
     - meta data saved during base model training
+
+    tokenizer: optionally inject a tokenizer (e.g. the polysemy identity tokenizer). When
+    None, the default BPE tokenizer is loaded. The model/tokenizer vocab-size sanity check
+    runs against whichever tokenizer is used.
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
@@ -115,8 +119,9 @@ def build_model(checkpoint_dir, step, device, phase):
         model.eval()
     else:
         model.train()
-    # Load the Tokenizer
-    tokenizer = get_tokenizer()
+    # Load the Tokenizer (use the injected one if provided, e.g. the identity tokenizer)
+    if tokenizer is None:
+        tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer.
     real_vocab = tokenizer.get_vocab_size()
     cfg_vocab = model_config_kwargs["vocab_size"]
@@ -156,7 +161,7 @@ def find_last_step(checkpoint_dir):
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
-def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
+def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None, tokenizer=None):
     if model_tag is None:
         # guess the model tag by defaulting to the largest model
         model_tag = find_largest_model(checkpoints_dir)
@@ -168,7 +173,7 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     assert step is not None, f"No checkpoints found in {checkpoint_dir}"
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
-    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase, tokenizer=tokenizer)
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):

@@ -10,7 +10,6 @@ For details of how the dataset was prepared, see `repackage_data_reference.py`.
 import os
 import argparse
 import time
-import requests
 import pyarrow.parquet as pq
 from multiprocessing import Pool
 
@@ -31,7 +30,18 @@ DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
 
 def list_parquet_files(data_dir=None, warn_on_legacy=False):
     """ Looks into a data dir and returns full paths to all parquet files. """
+    # An explicit data_dir (e.g. a polysemy condition dir) must exist as given — never fall
+    # back to the legacy ClimbMix path, which would silently load the wrong corpus.
+    explicit_dir = data_dir is not None
     data_dir = DATA_DIR if data_dir is None else data_dir
+    if explicit_dir:
+        assert os.path.isdir(data_dir), f"data_dir does not exist: {data_dir}"
+        parquet_files = sorted([
+            f for f in os.listdir(data_dir)
+            if f.endswith('.parquet') and not f.endswith('.tmp')
+        ])
+        assert parquet_files, f"No parquet shards found in {data_dir}"
+        return [os.path.join(data_dir, f) for f in parquet_files]
 
     # Legacy-supporting code due to the upgrade from FinewebEdu-100B to ClimbMix-400B
     # This code will eventually be deleted.
@@ -83,6 +93,10 @@ def parquets_iter_batched(split, start=0, step=1):
 # -----------------------------------------------------------------------------
 def download_single_file(index):
     """ Downloads a single file index, with some backoff """
+    # Imported lazily: the download path is the only thing needing requests, so importing
+    # nanochat.dataset (and the dataloader) stays usable in envs without a working requests
+    # (e.g. the polysemy experiment, which generates its corpus locally and never downloads).
+    import requests
 
     # Construct the local filepath for this file and skip if it already exists
     filename = index_to_filename(index)

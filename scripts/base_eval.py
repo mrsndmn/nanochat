@@ -262,6 +262,8 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    parser.add_argument('--data-dir', type=str, default=None, help='override parquet data dir for BPB (None = recover from checkpoint meta, else default ClimbMix)')
+    parser.add_argument('--tokenizer', type=str, default='auto', choices=['auto', 'bpe', 'identity'], help="tokenizer to use; 'auto' recovers it (and --data-dir) from the checkpoint's training config")
     parser.add_argument('--force', action='store_true', help='Re-run evaluation even if results already exist for this checkpoint.')
     args = parser.parse_args()
 
@@ -284,6 +286,7 @@ def main():
     is_hf_model = args.hf_path is not None
     checkpoint_dir = None
     resolved_step = None
+    data_dir = None  # BPB data dir; set from the checkpoint's training config for the nanochat path
     if is_hf_model:
         model, tokenizer = load_hf_model(args.hf_path, device)
         sequence_len = model.max_seq_len or 1024
@@ -304,6 +307,33 @@ def main():
         checkpoint_path = os.path.join(checkpoint_dir, f"model_{resolved_step:06d}.pt")
         print0(f"Resolved checkpoint: model_tag={model_tag} | step={resolved_step} | path={checkpoint_path}")
 
+        # Recover how the checkpoint was trained (tokenizer + data dir) from its meta json, so
+        # eval reuses the SAME tokenizer/corpus without the caller having to re-specify them.
+        # CLI flags override; 'auto' (default) means "take it from the training config".
+        train_cfg = {}
+        meta_json_path = os.path.join(checkpoint_dir, f"meta_{resolved_step:06d}.json")
+        if os.path.exists(meta_json_path):
+            try:
+                with open(meta_json_path, "r", encoding="utf-8") as f:
+                    train_cfg = json.load(f).get("user_config", {}) or {}
+            except (json.JSONDecodeError, OSError):
+                train_cfg = {}
+        tokenizer_kind = args.tokenizer if args.tokenizer != "auto" else train_cfg.get("tokenizer", "bpe")
+        data_dir = args.data_dir if args.data_dir is not None else train_cfg.get("data_dir")
+        use_identity = tokenizer_kind == "identity"
+
+        if use_identity:
+            # CORE (English ICL tasks) and the English sample prompts are meaningless for a
+            # synthetic-language model whose vocab is form symbols, so drop them.
+            dropped = eval_modes & {"core", "sample"}
+            if dropped:
+                print0(f"Identity tokenizer: skipping {sorted(dropped)} (not meaningful for the synthetic corpus)")
+            eval_modes = eval_modes - {"core", "sample"}
+            if not eval_modes:
+                print0("No applicable eval modes left for the identity tokenizer (only bpb is supported). Nothing to do.")
+                compute_cleanup()
+                return
+
         # Idempotency: if every requested persistent eval (core/bpb) already exists for this
         # exact checkpoint + seeds, do nothing. All ranks read the same JSON and decide alike.
         if not args.force and _eval_already_complete(checkpoint_dir, resolved_step, eval_modes, seeds):
@@ -312,9 +342,16 @@ def main():
             compute_cleanup()
             return
 
-        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=model_tag, step=resolved_step)
+        injected_tokenizer = None
+        if use_identity:
+            assert data_dir is not None, "identity tokenizer eval needs --data-dir (or a data_dir recorded in the checkpoint meta)"
+            from nanochat.identity_tokenizer import get_identity_tokenizer
+            injected_tokenizer = get_identity_tokenizer(data_dir)
+            print0(f"Using identity tokenizer from {data_dir} ({injected_tokenizer.num_forms} forms)")
+
+        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=model_tag, step=resolved_step, tokenizer=injected_tokenizer)
         sequence_len = meta["model_config"]["sequence_len"]
-        token_bytes = get_token_bytes(device=device)
+        token_bytes = injected_tokenizer.token_bytes(device=device) if use_identity else get_token_bytes(device=device)
         resolved_step = meta['step']
         model_name = f"base_model (step {resolved_step})"
         # Key all CORE artifacts by model_tag AND step so that distinct variants that finish
@@ -384,7 +421,7 @@ def main():
         steps = args.split_tokens // tokens_per_step
 
         for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device, data_dir=data_dir)
             stats = evaluate_bpb(model, loader, steps, token_bytes, return_stats=True)
             bpb_results[split_name] = stats["bpb"]
             loss_results[split_name] = stats["loss"]

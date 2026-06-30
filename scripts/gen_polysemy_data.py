@@ -27,9 +27,10 @@ import sys
 import time
 
 from nanochat.polysemy import (
-    GeneratorConfig, POS_CLASSES, build_default_pcfg, build_sense_inventory,
+    GeneratorConfig, POS_CLASSES, PROBE_SEED_OFFSET, build_default_pcfg, build_sense_inventory,
     generate_sense_corpus, _sense_probabilities, build_condition, default_conditions,
-    write_parquet_shards, write_vocab, write_metadata,
+    render_documents_with_senses, write_parquet_shards, write_vocab, write_metadata,
+    write_probe_jsonl,
 )
 
 
@@ -56,6 +57,7 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--max-len", type=int, default=40, help="max derivation length (senses)")
     p.add_argument("--tolerance", type=float, default=0.05, help="H(S|W) target tolerance (bits)")
     p.add_argument("--shard-chars", type=int, default=50_000_000, help="approx chars per parquet shard")
+    p.add_argument("--probe-docs", type=int, default=2000, help="held-out sense-labeled docs per condition for the representation probe (0 = skip)")
     p.add_argument("--dry", action="store_true", help="print the plan and exit without writing")
     p.add_argument("--force", action="store_true", help="overwrite a condition dir if it already exists")
     return p.parse_args()
@@ -99,6 +101,17 @@ def main() -> int:
     n_sense_tokens = sum(len(d) for d in sense_docs)
     print(f"  {len(sense_docs):,} docs | {n_sense_tokens:,} sense tokens | {time.time()-t0:.1f}s")
 
+    # Held-out sense stream for the representation probe (disjoint seed, shared across
+    # conditions so its syntax is held constant just like the training stream).
+    probe_sense_docs = None
+    if args.probe_docs > 0:
+        probe_sense_docs = generate_sense_corpus(
+            pcfg, inventory, num_tokens=args.probe_docs * args.max_len,
+            max_depth=args.max_depth, min_len=args.min_len, max_len=args.max_len,
+            seed=args.seed + PROBE_SEED_OFFSET,
+        )[: args.probe_docs]
+        print(f"Probe held-out stream: {len(probe_sense_docs):,} docs (sense-labeled)")
+
     vocab_sizes = set()
     for cond in conditions:
         cond_dir = os.path.join(out_root, cond.slug)
@@ -110,6 +123,9 @@ def main() -> int:
         paths = write_parquet_shards(documents, cond_dir, shard_chars=args.shard_chars)
         write_vocab(smap, cond_dir)
         write_metadata(metadata, cond_dir)
+        if probe_sense_docs is not None:
+            probe_records = render_documents_with_senses(probe_sense_docs, smap, seed=args.seed)
+            write_probe_jsonl(probe_records, cond_dir)
         vocab_sizes.add(smap.vocab_size)
         hsw = metadata["h_s_given_w"]
         ok = "ok" if hsw["within_tolerance"] else "OUT-OF-TOL"

@@ -20,7 +20,7 @@ import nanochat.dataloader as dl
 def fake_shards(monkeypatch):
     """Patch the file listing + DDP info so _document_batches runs without real data."""
     paths = [f"/fake/shard_{i:05d}.parquet" for i in range(10)]  # 9 train + 1 val
-    monkeypatch.setattr(dl, "list_parquet_files", lambda warn_on_legacy=False: list(paths))
+    monkeypatch.setattr(dl, "list_parquet_files", lambda data_dir=None, warn_on_legacy=False: list(paths))
     # single-process: rank 0 of world size 1
     monkeypatch.setattr(dl, "get_dist_info", lambda: (False, 0, 0, 1))
     return paths

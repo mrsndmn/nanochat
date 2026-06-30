@@ -20,8 +20,9 @@ import pytest
 from nanochat.polysemy import (
     GeneratorConfig, IdentityVocab, build_condition, build_default_pcfg,
     build_sense_form_map, build_sense_inventory, corpus_hsw, default_conditions,
-    generate_sense_corpus, render_documents, write_metadata, write_parquet_shards,
-    write_vocab, _sense_probabilities,
+    generate_sense_corpus, render_documents, render_documents_with_senses,
+    write_metadata, write_parquet_shards, write_probe_jsonl, write_vocab,
+    _sense_probabilities,
 )
 
 POS_FRACS = {"N": 0.45, "V": 0.30, "DET": 0.10, "P": 0.15}
@@ -129,6 +130,34 @@ def test_generation_is_deterministic(small_run):
     b = render_documents(sense_docs, build_sense_form_map(inventory, sense_prob, target_hsw=0.5,
                          overlap="partial", seed=cfg.seed), seed=cfg.seed)
     assert a == b
+
+
+def test_probe_set_export_aligns_forms_and_senses(tmp_path, small_run):
+    cfg, pcfg, inventory, sense_docs, sense_prob = small_run
+    smap = build_sense_form_map(inventory, sense_prob, target_hsw=1.5, overlap="none")
+    records = render_documents_with_senses(sense_docs[:20], smap, seed=cfg.seed)
+    assert len(records) == 20
+    for rec in records:
+        assert len(rec["forms"]) == len(rec["senses"]) > 0
+        # every recorded sense renders to its recorded form under the map (consistency)
+        for form, sense in zip(rec["forms"], rec["senses"]):
+            assert form in smap.sense_to_forms[sense]
+            assert sense in smap.form_to_senses[form]
+    # jsonl writer round-trips
+    path = write_probe_jsonl(records, str(tmp_path))
+    loaded = [json.loads(l) for l in open(path)]
+    assert loaded == records
+
+
+def test_probe_set_senses_independent_of_condition(small_run):
+    """The held-out sense stream is shared; only forms change across conditions (so a probe
+    decodes the SAME latent senses, with condition-specific surface forms)."""
+    cfg, pcfg, inventory, sense_docs, sense_prob = small_run
+    mono = build_sense_form_map(inventory, sense_prob, target_hsw=0.0, overlap="none")
+    homo = build_sense_form_map(inventory, sense_prob, target_hsw=1.5, overlap="none")
+    rec_mono = render_documents_with_senses(sense_docs[:10], mono, seed=cfg.seed)
+    rec_homo = render_documents_with_senses(sense_docs[:10], homo, seed=cfg.seed)
+    assert [r["senses"] for r in rec_mono] == [r["senses"] for r in rec_homo]
 
 
 def test_build_condition_and_write(tmp_path, small_run):

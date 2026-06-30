@@ -41,8 +41,15 @@ import numpy as np
 # Some envs ship a pandas compiled against a different numpy ABI; importing it raises a
 # ValueError (not ImportError) mid-import. pyarrow's array path lazily imports pandas and
 # would crash on it. We never use pandas here, so if pandas is broken we install a finder
-# that makes future `import pandas` raise a clean ImportError, which pyarrow's pandas shim
-# catches and skips. This is a no-op where pandas imports fine.
+# that makes an actual `import pandas` raise a clean ImportError, which pyarrow's pandas
+# shim catches and skips. This is a no-op where pandas imports fine.
+#
+# The finder raises ONLY for a real import (driven by importlib's _find_and_load); a bare
+# existence probe via importlib.util.find_spec (e.g. torch._dynamo's trace_rules, which
+# checks whether 'pandas' is installed) gets a clean "not found" (None) instead. Raising on
+# the probe would propagate out of torch and break any torch._dynamo / torch.compile use in
+# the same process — fatal for the component-3 probe + its tests, which import the generator
+# (installing this finder) alongside the GPT/torch stack.
 if "pandas" not in sys.modules:
     try:
         import pandas as _pandas_probe  # noqa: F401
@@ -51,8 +58,25 @@ if "pandas" not in sys.modules:
 
         class _BrokenPandasBlocker(importlib.abc.MetaPathFinder):
             def find_spec(self, name, path=None, target=None):
-                if name == "pandas" or name.startswith("pandas."):
-                    raise ImportError("pandas is broken in this env; disabled for nanochat.polysemy")
+                if not (name == "pandas" or name.startswith("pandas.")):
+                    return None
+                # Decide by the nearest enclosing import frame:
+                #  - if it is `_find_and_load(_unlocked)` actually loading pandas -> real
+                #    import -> raise a clean ImportError (pyarrow's shim catches it);
+                #  - if we first hit importlib.util.find_spec -> a bare existence probe
+                #    (e.g. torch._dynamo's trace_rules, even while it is itself being
+                #    imported) -> report "not found" (None) so it never blows up.
+                f = sys._getframe(1)
+                while f is not None:
+                    code = f.f_code
+                    if code.co_name in ("_find_and_load", "_find_and_load_unlocked"):
+                        loading = f.f_locals.get("name", "")
+                        if isinstance(loading, str) and (loading == "pandas" or loading.startswith("pandas.")):
+                            raise ImportError("pandas is broken in this env; disabled for nanochat.polysemy")
+                        return None  # importing something else; our pandas lookup is nested -> probe
+                    if code.co_name == "find_spec" and "importlib" in (code.co_filename or ""):
+                        return None  # importlib.util.find_spec existence probe
+                    f = f.f_back
                 return None
 
         sys.modules.pop("pandas", None)
@@ -575,6 +599,26 @@ def render_documents(sense_docs: Sequence[Sequence[int]], smap: SenseFormMap, *,
     return out
 
 
+def render_documents_with_senses(sense_docs: Sequence[Sequence[int]], smap: SenseFormMap, *,
+                                 seed: int = 0) -> List[Dict[str, list]]:
+    """Render docs to forms while keeping the aligned ground-truth sense id at each position.
+
+    Returns one ``{"forms": [...], "senses": [...]}`` record per document (parallel arrays).
+    This is the sense-labeled probe set: the form stream is what the LM sees, the sense
+    stream is the latent label a representation probe (component 3) tries to decode from the
+    model's hidden state — the test of whether context resolves polysemy.
+    """
+    rng = np.random.default_rng(seed)
+    out: List[Dict[str, list]] = []
+    for doc in sense_docs:
+        forms: List[str] = []
+        for s in doc:
+            allo = smap.sense_to_forms[s]
+            forms.append(allo[0] if len(allo) == 1 else allo[int(rng.integers(len(allo)))])
+        out.append({"forms": forms, "senses": [int(s) for s in doc]})
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Analytic PCFG entropy (calibration baseline; uncapped grammar)
 
@@ -833,6 +877,22 @@ def write_parquet_shards(documents: Sequence[str], out_dir: str, *, shard_chars:
             _write_text_parquet(list(part), path, row_group_size)
             paths.append(path)
     return paths
+
+
+# Seed offset for the held-out probe stream, so its derivations are disjoint from the
+# training sense stream (which uses the run seed) while staying deterministic.
+PROBE_SEED_OFFSET = 1_000_003
+
+
+def write_probe_jsonl(probe_records: Sequence[Dict[str, list]], out_dir: str,
+                      filename: str = "probe.jsonl") -> str:
+    """Write the sense-labeled probe set (one JSON object per line: forms + senses)."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in probe_records:
+            f.write(json.dumps(rec) + "\n")
+    return path
 
 
 def write_vocab(smap: SenseFormMap, out_dir: str) -> str:

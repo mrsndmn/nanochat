@@ -22,6 +22,90 @@ from typing import List
 # Experiment definitions
 # ---------------------------------------------------------------------------
 
+# Absolute polysemy data root on the shared artifacts store (mirrors base_dir_local below,
+# so the path resolves identically in this session and inside worker containers). The
+# generator (scripts.gen_polysemy_data) writes one <condition_slug>/ dir of parquet shards +
+# vocab.json + metadata.json under here. Run it before launching these jobs.
+POLYSEMY_DATA_ROOT = "/workspace-SR004.nfs2/d.tarasov/nanochat-artifacts/base_data_polysemy"
+
+# The context-length sweep L (= model sequence length / dataloader row capacity-1). The
+# experiment hypothesis is gap(L) = PPL_poly(L) - PPL_mono(L) -> 0 as L grows.
+POLYSEMY_SEQ_LENS = (8, 32, 128, 512)
+
+
+def polysemy_context_experiments(data_root: str = POLYSEMY_DATA_ROOT) -> list[dict]:
+    """Polysemy × Context: train one tiny LM per (condition, context-length L) cell.
+
+    Component 2 of the synthetic-language experiment (see
+    run/deep-interview/deep-interview-polysemy-context.md and experiments/polysemy_context.md).
+    Each arm trains on a single synthetic condition corpus via the **identity tokenizer**
+    (1 form = 1 token id; no BPE) at one context length L. Holding model + data + horizon
+    fixed and sweeping only L lets component 3 read off gap(L): the polysemy perplexity
+    penalty should shrink as context grows (more left-context resolves the latent sense).
+
+    Grid = default_conditions() {mono, hsw0.5×{homonymy,overlap}, hsw1.5×{homonymy,overlap}}
+    × L ∈ {8,32,128,512}. mono is the monosemous baseline (H(S|W)=0) that every gap(L) is
+    measured against; |V| is held equal across conditions by the generator.
+
+    Fixed knobs (source of truth — do not duplicate in the .md):
+    - depth 6 (a small model; |V| ~ hundreds, so capacity is never the bottleneck and any
+      gap reflects context-resolvability, not under-parameterization);
+    - --window-pattern L: FULL attention. A sliding window would cap the usable context and
+      confound the very axis we sweep, so it is disabled;
+    - --total-batch-size 32768 held constant across L for comparability (it divides
+      device_batch_size*L*4gpu for every L in the sweep);
+    - 10k steps, single seed (project convention: one run per config, no multi-seed fan-out);
+    - CORE + sampling disabled (English ICL / prompts are meaningless for a synthetic vocab);
+      a light val-bpb eval stays on so the checkpoint meta records val loss / PPL for the
+      analysis, which also runs a final controlled BPB via run_evaluation.py --eval bpb.
+    """
+    experiment_slug = "polysemy-context"
+    num_gpus = 4
+    instance_type = "a100.4gpu"
+    depth = 6
+    seed = 0
+
+    # nanochat.polysemy is the source of truth for the condition grid (slug + target H(S|W)).
+    from nanochat.polysemy import default_conditions
+    conditions = default_conditions()
+
+    shared_args = [
+        f"--depth {depth}",
+        "--window-pattern L",            # full attention: the context-length sweep must not be capped by a window
+        "--tokenizer identity",
+        "--num-iterations 10000",
+        "--total-batch-size 32768",      # held constant across L (divides device_bs*L*num_gpus for all L)
+        "--device-batch-size 16",
+        "--eval-every 1000",             # light in-training val so checkpoint meta carries val loss / PPL
+        "--eval-tokens 262144",
+        "--core-metric-every -1",        # CORE = English ICL: meaningless for the synthetic vocab
+        "--sample-every -1",             # sample prompts are English: meaningless here
+        f"--seed {seed}",
+    ]
+
+    configs = []
+    for cond in conditions:
+        data_dir = f"{data_root}/{cond.slug}"
+        for seq_len in POLYSEMY_SEQ_LENS:
+            args_parts = shared_args + [f"--max-seq-len {seq_len}", f"--data-dir {data_dir}"]
+            args_str = " ".join(args_parts).strip()
+            cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+            model_tag = f"poly_{cond.slug}_L{seq_len}"
+            description = (
+                f"polysemy×context: cond={cond.slug} (H(S|W) target={cond.target_hsw}, "
+                f"overlap={cond.overlap}) L={seq_len}, d{depth} identity-tok 10k"
+            )
+            configs.append({
+                "args": args_str,
+                "model_tag": model_tag,
+                "description": description,
+                "cmd_hash": cmd_hash,
+                "instance_type": instance_type,
+                "experiment_slug": experiment_slug,
+                "num_gpus": num_gpus,
+            })
+    return configs
+
 
 # ---------------------------------------------------------------------------
 # CLI and job submission
@@ -88,7 +172,17 @@ if __name__ == "__main__":
     # Aggregate all experiment configs
     # -----------------------------------------------------------------------
     experiment_configs = [
+        *polysemy_context_experiments(),
     ]
+
+    # Warn (don't fail) if a condition's data dir is missing — the generator must be run
+    # first (python -m scripts.gen_polysemy_data). Check the absolute shared store directly.
+    data_dirs = {
+        c["args"].split("--data-dir ", 1)[1].split()[0]
+        for c in experiment_configs if "--data-dir " in c["args"]
+    }
+    for d in sorted(d for d in data_dirs if not os.path.isdir(d)):
+        print(f"\033[33mWARNING: polysemy data dir not found (run scripts.gen_polysemy_data first):\033[0m {d}")
 
     for experiment_config in experiment_configs:
         jobs_planned += 1
