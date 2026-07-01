@@ -920,8 +920,15 @@ def _write_text_parquet(docs: Sequence[str], path: str, row_group_size: int) -> 
 
 
 def write_parquet_shards(documents: Sequence[str], out_dir: str, *, shard_chars: int = 50_000_000,
-                         row_group_size: int = 1024) -> List[str]:
-    """Write documents to zstd parquet shards (single 'text' column), matching the trainer's format."""
+                         row_group_size: int = 128) -> List[str]:
+    """Write documents to zstd parquet shards (single 'text' column), matching the trainer's format.
+
+    row_group_size defaults to 128 (not 1024): the DDP dataloader shards a file's row groups
+    across ranks, so a shard must have at least ddp_world_size row groups or high-index ranks
+    get no data and the job deadlocks. These condition corpora are small (~a few thousand docs
+    per shard); at 1024 a shard held only 2-3 row groups, which starved rank 3 on a 4-GPU run.
+    128 keeps every shard comfortably above typical world sizes.
+    """
     os.makedirs(out_dir, exist_ok=True)
     # Remove any pre-existing shards first, so a regeneration that yields a different shard
     # count never leaves stale shards from a prior run mixed in with the new corpus.

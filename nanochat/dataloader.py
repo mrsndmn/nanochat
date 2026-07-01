@@ -64,6 +64,26 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, num_train_
         while pq_idx < len(parquet_paths):
             filepath = parquet_paths[pq_idx]
             pf = pq.ParquetFile(filepath)
+            # Degenerate shard: fewer row groups than ranks. Whole-row-group sharding
+            # (rg_idx = ddp_rank; rg_idx += ddp_world_size) would hand ranks with index
+            # >= num_row_groups *zero* documents, so their buffer never fills and the whole
+            # job deadlocks at the next collective (seen on the small polysemy condition shards,
+            # which have 2-3 row groups against a 4-GPU world). Fall back to row-level sharding
+            # so every rank still gets a disjoint, balanced slice of this file's documents.
+            # Read via read_row_group (not pf.read) to match the proven-working call below and
+            # sidestep the pandas/pyarrow ABI hazard some envs have with read_table.
+            if ddp_world_size > pf.num_row_groups:
+                texts = []
+                for g in range(pf.num_row_groups):
+                    texts.extend(pf.read_row_group(g).column('text').to_pylist())
+                my_texts = texts[ddp_rank::ddp_world_size]
+                for i in range(0, len(my_texts), tokenizer_batch_size):
+                    yield my_texts[i:i+tokenizer_batch_size], (pq_idx, ddp_rank, epoch)
+                # A fine-grained resume position inside this file no longer applies; consume it.
+                if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
+                    resume_rg_idx = None
+                pq_idx += 1
+                continue
             # Start from resume point if resuming on same file, otherwise from DDP rank
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
                 base_idx = resume_rg_idx // ddp_world_size
