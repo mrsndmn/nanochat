@@ -923,6 +923,11 @@ def write_parquet_shards(documents: Sequence[str], out_dir: str, *, shard_chars:
                          row_group_size: int = 1024) -> List[str]:
     """Write documents to zstd parquet shards (single 'text' column), matching the trainer's format."""
     os.makedirs(out_dir, exist_ok=True)
+    # Remove any pre-existing shards first, so a regeneration that yields a different shard
+    # count never leaves stale shards from a prior run mixed in with the new corpus.
+    import glob as _glob
+    for _stale in _glob.glob(os.path.join(out_dir, "shard_*.parquet")):
+        os.remove(_stale)
     paths: List[str] = []
     shard_docs: List[str] = []
     shard_chars_count = 0
