@@ -26,6 +26,18 @@ echo "NANOCHAT_BASE_DIR=$NANOCHAT_BASE_DIR"
 # Add environment prefix to PATH
 PATH=$ENV_PREFIX:$PATH
 
+# Serialize torch.compile / Inductor compilation (compile inline in-process, no async
+# worker-subprocess pool). With the default (unset) COMPILE_THREADS, Inductor forks up to
+# ~min(32, ncpu) compile workers PER RANK; with 4 ranks sharing one node those pools
+# heavily oversubscribe the CPUs and can deadlock the fork-after-CUDA-init on a subset of
+# ranks. That is exactly what hung the first polysemy L2048 4-GPU run: the step-0 val eval
+# is the first torch.compile of the run, ranks 0/1 compiled and reached the eval all_reduce
+# while ranks 2/3 hung in compilation with no error -> NCCL watchdog timeout at SeqNum=2.
+# Inline compilation removes that worker pool; the per-run compile cost is a few extra
+# seconds for these tiny d6 models. Any forwarded value takes precedence.
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
+echo "TORCHINDUCTOR_COMPILE_THREADS=$TORCHINDUCTOR_COMPILE_THREADS"
+
 # Jobs run under MPI, extract master node info for DDP
 MASTER_HOST_PREFIX=$(perl -E "my \$x = '$PMIX_HOSTNAME'; \$x =~ s/-\w+-\d+$//; print \$x ")
 MASTER_HOST=$(perl -E "my \$x = '$PMIX_HOSTNAME'; \$x =~ s/-\w+-\d+$/-mpimaster-0/; print \$x ")
