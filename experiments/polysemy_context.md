@@ -36,22 +36,49 @@ Decisions recorded as ADRs: `docs/adr/0003` (forms-are-tokens / identity tokeniz
 `docs/adr/0005` (component-2/3 integration: identity load path, eval config recovery, BPC=bits/form).
 
 ## Results
-- **Component 1** validated (`tests/test_polysemy_generator.py`) and smoke-run at K=512: every
-  condition hits its target `H(S|W)` within ±0.05 bits, `|V|` constant at 512, polysemy spread
-  across many forms (meaning-frequency law), corpora reload as a 1:1 form↔token stream.
-- **Components 2 & 3** validated end to end (CPU smoke + unit tests, 82 passing): `base_train`
-  trains a d2 identity-tokenizer model and saves a checkpoint+meta; `base_eval --tokenizer auto`
-  recovers the config from meta, skips CORE, and reports bpb == bits/form (= loss/ln2);
-  `analyze_polysemy` produces the PPL/BPC/gap tables + verdicts from checkpoint metas + the
-  generator metadata; `probe_polysemy` extracts hidden states and fits the sense-decoding probe.
-  The training/eval grid (20 jobs) is ready to launch; the headline `gap(L)` numbers come from
-  running it.
+Analysis reflects **currently-available eval data only**. This evaluation sweep returned
+**"No checkpoints found"**: no arm in the condition × context-length grid has a trained checkpoint
+yet, so there are **no BPB / gap(L) numbers to report this run** — every arm is pending. (The one
+checkpoint on disk is a d2 CPU smoke, `polytest_smoke`, step 2, `val_bpb = null`, on a `.tmp`
+data dir — not an experiment arm.)
+
+- **Data generation — complete and validated** for all 5 conditions in the long-document regime
+  (|V| = 512, ~155k docs, ~400M tokens each). Measured `H(S|W)` lands within ±0.05 bits of target
+  in every condition:
+
+  | condition        | target H(S\|W) | measured H(S\|W) |
+  | ---------------- | -------------- | ---------------- |
+  | mono (baseline)  | 0.00           | 0.000            |
+  | hsw0p5_homonymy  | 0.50           | 0.485            |
+  | hsw0p5_overlap   | 0.50           | 0.473            |
+  | hsw1p5_homonymy  | 1.50           | 1.491            |
+  | hsw1p5_overlap   | 1.50           | 1.466            |
+
+- **Training / evaluation — no results.** With no trained checkpoints, the intended per-arm
+  comparison (each polysemous arm's `gap(L) = PPL_poly − PPL_mono` against the `mono` baseline;
+  homonymy vs overlap at matched `H(S|W)`) cannot be computed. The probe likewise only ran on the
+  smoke checkpoint.
+
+- **Metric note.** These synthetic-vocab arms **skip CORE and sample by design** (English ICL is
+  meaningless for the identity vocab), so **BPB (== bits-per-form) is the sole primary metric** and
+  is seed-stable. The ±0.01 single-seed CORE-noise caveat does **not** apply here — CORE is never
+  evaluated for this experiment.
 
 ## Conclusions
-The full pipeline (generate → train across L → analyze gap(L) + probe) is implemented and tested.
-Next: run `scripts.gen_polysemy_data`, launch `run_training.polysemy_context_experiments` (20
-arms), then `scripts.analyze_polysemy` + `scripts.probe_polysemy` to read off whether
-`gap(L) → 0` (expected for homonymy) vs plateaus above 0 (expected for overlapping polysemy).
+**Hypothesis status: untested — neither supported nor refuted.** The generate → train → analyze
+pipeline is built and the generator is validated, but with no trained checkpoints this run yields
+no `gap(L)`. The blocker is purely that the training grid has not produced checkpoints — this is a
+missing-data state, not a negative result.
+
+Next steps:
+1. **Launch the condition × L training grid** from the worktree/branch that carries
+   `polysemy_context_experiments` (this analysis worktree does not); confirm checkpoints land under
+   `base_checkpoints/` before evaluating.
+2. **Re-run evaluation (BPB)** once checkpoints exist, then `scripts.analyze_polysemy`
+   (gap(L), BPC-vs-floor, lexical `H_m` decomposition) and `scripts.probe_polysemy`.
+3. **Read gap(L) directly off BPB** (seed-stable; CORE not applicable) — for each polysemous arm
+   vs the `mono` baseline across L ∈ {512, 1024, 2048}. Test whether homonymy decays toward 0 while
+   overlap plateaus above 0, and cross-check the sense-probe accuracy-vs-context curve.
 
 ## Changelog
 - 2026-06-30: Hardened the spec via deep interview (5 glossary terms, ADRs 0003/0004) and
@@ -73,3 +100,8 @@ arms), then `scripts.analyze_polysemy` + `scripts.probe_polysemy` to read off wh
   documents (continuation knob). Reworked the sweep to **L ∈ {512,1024,2048}** at a constant 32768
   global batch with per-L device batch 16/8/4 (grad-accum=1, identical optimization steps),
   `--eval-every 2500`, no `--eval-tokens` override. Validated H(S|W) within ±0.05 on long docs.
+- 2026-07-01: Data generation for all 5 conditions completed and validated (H(S|W) within ±0.05 of
+  target; |V|=512; ~400M tokens/condition). First evaluation sweep returned "No checkpoints found" —
+  the training grid has not yet produced checkpoints, so gap(L) is still pending and the hypothesis
+  remains untested. Confirmed BPB (bits-per-form) as the sole primary metric (CORE/sample skipped
+  for synthetic vocab; single-seed CORE-noise caveat N/A).
