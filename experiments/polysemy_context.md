@@ -36,49 +36,73 @@ Decisions recorded as ADRs: `docs/adr/0003` (forms-are-tokens / identity tokeniz
 `docs/adr/0005` (component-2/3 integration: identity load path, eval config recovery, BPC=bits/form).
 
 ## Results
-Analysis reflects **currently-available eval data only**. This evaluation sweep returned
-**"No checkpoints found"**: no arm in the condition × context-length grid has a trained checkpoint
-yet, so there are **no BPB / gap(L) numbers to report this run** — every arm is pending. (The one
-checkpoint on disk is a d2 CPU smoke, `polytest_smoke`, step 2, `val_bpb = null`, on a `.tmp`
-data dir — not an experiment arm.)
+First full condition×L results — all **15 arms trained** (10k steps). Primary metric is
+**BPB (== bits-per-form)**; CORE/sample are skipped by design (synthetic vocab), so those columns
+are blank. **No dedicated evaluation stage ran** — `base_eval_results/` holds no JSON for these
+tags — so every number below is the **in-training `val_bpb` from the step-10000 checkpoint meta**,
+not a controlled fixed-budget BPB eval. All 15 arms carry a `val_bpb`; the only checkpoint without
+one is `polytest_smoke` (d2 CPU smoke, step 2, `val_bpb = inf`), which is not an arm.
 
-- **Data generation — complete and validated** for all 5 conditions in the long-document regime
-  (|V| = 512, ~155k docs, ~400M tokens each). Measured `H(S|W)` lands within ±0.05 bits of target
-  in every condition:
+**Raw BPB (lower = better):**
 
-  | condition        | target H(S\|W) | measured H(S\|W) |
-  | ---------------- | -------------- | ---------------- |
-  | mono (baseline)  | 0.00           | 0.000            |
-  | hsw0p5_homonymy  | 0.50           | 0.485            |
-  | hsw0p5_overlap   | 0.50           | 0.473            |
-  | hsw1p5_homonymy  | 1.50           | 1.491            |
-  | hsw1p5_overlap   | 1.50           | 1.466            |
+| condition (H(S\|W) target) | L512   | L1024  | L2048  |
+| -------------------------- | ------ | ------ | ------ |
+| poly_mono (0.0)            | 5.2705 | 5.2764 | 5.2906 |
+| hsw0p5_homonymy (0.5)      | 5.2818 | 5.2876 | 5.3027 |
+| hsw1p5_homonymy (1.5)      | 5.3162 | 5.3218 | 5.3367 |
+| hsw0p5_overlap (0.5)       | 4.7951 | 4.8016 | 4.8180 |
+| hsw1p5_overlap (1.5)       | 3.8026 | 3.8110 | 3.8317 |
 
-- **Training / evaluation — no results.** With no trained checkpoints, the intended per-arm
-  comparison (each polysemous arm's `gap(L) = PPL_poly − PPL_mono` against the `mono` baseline;
-  homonymy vs overlap at matched `H(S|W)`) cannot be computed. The probe likewise only ran on the
-  smoke checkpoint.
+**gap(L) = BPB_poly − BPB_mono (the hypothesis metric):**
+
+| condition       | L512   | L1024  | L2048  |
+| --------------- | ------ | ------ | ------ |
+| hsw0p5_homonymy | +0.011 | +0.011 | +0.012 |
+| hsw1p5_homonymy | +0.046 | +0.045 | +0.046 |
+| hsw0p5_overlap  | −0.475 | −0.475 | −0.473 |
+| hsw1p5_overlap  | −1.468 | −1.465 | −1.459 |
+
+- **Homonymy (clean arm — cross-class merge, context should resolve).** The penalty is small and
+  **positive**, scaling with injected sense entropy (~+0.011 @ H(S|W)=0.5, ~+0.046 @ 1.5) but sitting
+  **far below the injected H(S|W)** — only ~2–3% of the 0.5/1.5 injected bits survive as excess BPB.
+  The model already resolves ~97% of the sense uncertainty from context. **But gap(L) does not shrink
+  across L∈{512,1024,2048} — it is flat (even ticks up slightly).** The predicted `gap(L)→0` decay is
+  therefore **not visible in this L window**: the residual is already at floor by L=512.
+- **Overlap (same-class merge — residual H(S|W,C)>0).** BPB falls **far below mono** (gap ≈ −0.47 @
+  H=0.5, ≈ −1.47 @ 1.5, i.e. ≈ −H(S|W)). Same-class merging collapses senses onto shared forms in
+  shared contexts, which **lowers the source form-entropy floor** — so overlap is *not* a valid
+  matched-H(S|W) comparison to mono; its negative "gap" is a floor artifact, not a polysemy penalty,
+  and must be read floor-relative (BPC-vs-floor), not mono-relative.
+- **Context length.** BPB is essentially flat and **rises slightly with L** for every arm, mono
+  included (mono 5.2705→5.2906). Longer context did not lower per-form loss — consistent with sense
+  already resolved by L=512, the tiny L-trend dominated by long-range positions / optimization rather
+  than sense resolution.
 
 - **Metric note.** These synthetic-vocab arms **skip CORE and sample by design** (English ICL is
-  meaningless for the identity vocab), so **BPB (== bits-per-form) is the sole primary metric** and
-  is seed-stable. The ±0.01 single-seed CORE-noise caveat does **not** apply here — CORE is never
-  evaluated for this experiment.
+  meaningless for the identity vocab), so **BPB is the sole primary metric** and is seed-stable. The
+  ±0.01 single-seed CORE-noise caveat does **not** apply here — CORE is never evaluated for this
+  experiment.
 
 ## Conclusions
-**Hypothesis status: untested — neither supported nor refuted.** The generate → train → analyze
-pipeline is built and the generator is validated, but with no trained checkpoints this run yields
-no `gap(L)`. The blocker is purely that the training grid has not produced checkpoints — this is a
-missing-data state, not a negative result.
+**Hypothesis status: partially supported, but the specific `gap(L)→0` decay is untested in this
+window.** The mechanism the hypothesis rests on — context resolves injected sense uncertainty — holds
+strongly on the clean **homonymy** arm: only ~2–3% of the injected H(S|W) survives as excess BPB. But
+the sweep starts too long: by L=512 the residual is already at floor, so gap(L) is flat across
+{512,1024,2048} and the decay curve itself is never observed. The **overlap** arms are confounded by a
+lowered form-entropy floor (negative gap ≈ −H(S|W)) and cannot be compared to mono directly.
 
 Next steps:
-1. **Launch the condition × L training grid** from the worktree/branch that carries
-   `polysemy_context_experiments` (this analysis worktree does not); confirm checkpoints land under
-   `base_checkpoints/` before evaluating.
-2. **Re-run evaluation (BPB)** once checkpoints exist, then `scripts.analyze_polysemy`
-   (gap(L), BPC-vs-floor, lexical `H_m` decomposition) and `scripts.probe_polysemy`.
-3. **Read gap(L) directly off BPB** (seed-stable; CORE not applicable) — for each polysemous arm
-   vs the `mono` baseline across L ∈ {512, 1024, 2048}. Test whether homonymy decays toward 0 while
-   overlap plateaus above 0, and cross-check the sense-probe accuracy-vs-context curve.
+1. **Add short-L anchors** (e.g. L∈{8,32,128}) so the sweep spans the pre-resolution regime where the
+   homonymy gap is still large — that is where the decay to floor should be visible. The long-doc
+   pivot overshot the resolution horizon.
+2. **Measure gap within a sequence** via `scripts.probe_polysemy` (sense-decode accuracy bucketed by
+   left-context length) and `scripts.analyze_polysemy`'s position-resolved BPC — reads off the decay
+   decoupled from the training-L confound, reusing the long-doc checkpoints already in hand.
+3. **De-confound overlap** — compare overlap arms **floor-relative** (BPC-vs-analytic-floor, already
+   built) rather than mono-relative, or hold the form marginal constant so overlap adds residual
+   ambiguity without lowering the floor.
+4. **Run the controlled BPB evaluation stage** (`run_evaluation.py --eval bpb`) to replace the
+   in-training `val_bpb` with a fixed-token-budget BPB per arm before drawing final conclusions.
 
 ## Changelog
 - 2026-06-30: Hardened the spec via deep interview (5 glossary terms, ADRs 0003/0004) and
@@ -105,3 +129,10 @@ Next steps:
   the training grid has not yet produced checkpoints, so gap(L) is still pending and the hypothesis
   remains untested. Confirmed BPB (bits-per-form) as the sole primary metric (CORE/sample skipped
   for synthetic vocab; single-seed CORE-noise caveat N/A).
+- 2026-07-02: First full condition×L results — all 15 arms trained. BPB read from the step-10000
+  checkpoint meta (in-training `val_bpb`; **no dedicated eval-stage JSON on disk**; CORE/sample blank
+  by design). Homonymy penalty is small/positive and ≪ injected H(S|W) (~+0.011 @0.5, ~+0.046 @1.5)
+  but **flat across L∈{512,1024,2048}** — decay not observed, residual already at floor by L=512.
+  Overlap arms fall far below mono (gap ≈ −H(S|W)) — a lowered form-entropy-floor confound, not a
+  polysemy penalty. Next: short-L anchors + within-sequence probe to expose the decay; floor-relative
+  comparison for overlap; run the controlled BPB eval stage.
