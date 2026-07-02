@@ -53,6 +53,52 @@ def _find_last_step(checkpoint_dir: Path) -> int:
     return max(steps) if steps else -1
 
 
+# NFS mount prefixes: the launcher node sees /mnt/virtual_.../, worker containers see
+# /workspace-SR004.nfs2/. A data_dir recorded in a checkpoint meta may use either, so
+# existence checks on the launcher must try both.
+_MNT_PREFIX = "/mnt/virtual_ai0001053-00054_SR004-nfs2/"
+_WS_PREFIX = "/workspace-SR004.nfs2/"
+
+
+def _path_visible_here(path: str) -> bool:
+    """True if `path` exists on the launcher node, trying both NFS mount prefixes."""
+    if not path:
+        return False
+    candidates = {
+        path,
+        path.replace(_WS_PREFIX, _MNT_PREFIX),
+        path.replace(_MNT_PREFIX, _WS_PREFIX),
+    }
+    return any(os.path.exists(c) for c in candidates)
+
+
+def _evaluability_skip_reason(checkpoint_dir: Path) -> str:
+    """Return a reason string if this checkpoint's eval cannot even start, else ''.
+
+    Currently guards the identity-tokenizer path: base_eval.py recovers the training
+    tokenizer + data_dir from the checkpoint meta and loads vocab.json from that data_dir.
+    A throwaway smoke run whose synthetic corpus lived under an ephemeral .tmp/ dir leaves
+    a checkpoint whose data_dir has since been cleaned up, so its eval crashes with
+    FileNotFoundError. Real experiment corpora live in the persistent shared store and pass.
+    """
+    step = _find_last_step(checkpoint_dir)
+    if step < 0:
+        return ""  # handled elsewhere (no checkpoints)
+    meta_path = checkpoint_dir / f"meta_{step:06d}.json"
+    if not meta_path.exists():
+        return ""  # nothing to check against; let base_eval fall back to defaults
+    try:
+        with open(meta_path) as f:
+            user_config = json.load(f).get("user_config", {}) or {}
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if user_config.get("tokenizer") == "identity":
+        data_dir = user_config.get("data_dir")
+        if not data_dir or not _path_visible_here(os.path.join(data_dir, "vocab.json")):
+            return f"identity-tokenizer corpus missing (data_dir={data_dir}) — likely a stale smoke checkpoint"
+    return ""
+
+
 def _has_eval_results(checkpoint_dir: Path, step: int, eval_modes: set, seeds: List[int]) -> bool:
     """Check if evaluation results already exist for the given step and seeds.
 
@@ -180,6 +226,19 @@ if __name__ == "__main__":
     # Discover checkpoints (in the persistent artifacts base dir)
     base_checkpoints_dir = Path(base_dir_local) / "base_checkpoints"
     model_tags = _find_model_tags(base_checkpoints_dir, model_filter=args.model_filter)
+
+    # Drop checkpoints whose eval cannot even start (e.g. a stale smoke run whose
+    # identity-tokenizer corpus lived under an ephemeral .tmp/ dir now cleaned up). This
+    # keeps a throwaway checkpoint from failing the whole eval stage; real experiment
+    # checkpoints reference the persistent shared corpus and are unaffected.
+    evaluable_tags = []
+    for tag in model_tags:
+        reason = _evaluability_skip_reason(base_checkpoints_dir / tag)
+        if reason:
+            _log(f"\033[33mSkipping {tag}: {reason}\033[0m", output_json)
+            continue
+        evaluable_tags.append(tag)
+    model_tags = evaluable_tags
 
     if not model_tags:
         _log(f"No model checkpoints found under {base_checkpoints_dir}", output_json)
