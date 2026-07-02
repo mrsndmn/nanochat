@@ -36,12 +36,13 @@ Decisions recorded as ADRs: `docs/adr/0003` (forms-are-tokens / identity tokeniz
 `docs/adr/0005` (component-2/3 integration: identity load path, eval config recovery, BPC=bits/form).
 
 ## Results
-First full condition×L results — all **15 arms trained** (10k steps). Primary metric is
-**BPB (== bits-per-form)**; CORE/sample are skipped by design (synthetic vocab), so those columns
-are blank. **No dedicated evaluation stage ran** — `base_eval_results/` holds no JSON for these
-tags — so every number below is the **in-training `val_bpb` from the step-10000 checkpoint meta**,
-not a controlled fixed-budget BPB eval. All 15 arms carry a `val_bpb`; the only checkpoint without
-one is `polytest_smoke` (d2 CPU smoke, step 2, `val_bpb = inf`), which is not an arm.
+Full condition×L results — all **15 arms trained** (10k steps) and now **evaluated by the dedicated
+fixed-budget BPB stage** (per-arm `base_checkpoints/<tag>/evaluation/bpb_010000.json`). Primary metric
+is **BPB (== bits-per-form)**; CORE/sample stay blank by design (synthetic vocab). The controlled-eval
+BPB **reproduces the in-training `val_bpb`** to ≤0.005 on every arm (most <0.001; the only visible
+deltas are ≈+0.003–0.005 at L2048), so the aggregated step-10000 `val_bpb` numbers below stand. The
+only checkpoint without a `val_bpb` is `polytest_smoke` (d2 CPU smoke, step 2, `val_bpb = inf`), which
+is not an arm and is correctly skipped.
 
 **Raw BPB (lower = better):**
 
@@ -101,8 +102,9 @@ Next steps:
 3. **De-confound overlap** — compare overlap arms **floor-relative** (BPC-vs-analytic-floor, already
    built) rather than mono-relative, or hold the form marginal constant so overlap adds residual
    ambiguity without lowering the floor.
-4. **Run the controlled BPB evaluation stage** (`run_evaluation.py --eval bpb`) to replace the
-   in-training `val_bpb` with a fixed-token-budget BPB per arm before drawing final conclusions.
+
+The controlled fixed-budget BPB eval stage has now run (former next-step #4) and agrees with the
+in-training numbers to ≤0.005 BPB, so no BPB re-eval is needed before the above.
 
 ## Changelog
 - 2026-06-30: Hardened the spec via deep interview (5 glossary terms, ADRs 0003/0004) and
@@ -136,3 +138,10 @@ Next steps:
   Overlap arms fall far below mono (gap ≈ −H(S|W)) — a lowered form-entropy-floor confound, not a
   polysemy penalty. Next: short-L anchors + within-sequence probe to expose the decay; floor-relative
   comparison for overlap; run the controlled BPB eval stage.
+- 2026-07-02: Ran the **dedicated fixed-budget BPB eval stage** over all 15 arms (per-checkpoint
+  `evaluation/bpb_010000.json`). Controlled BPB **reproduces the in-training `val_bpb`** to ≤0.005
+  (largest deltas ≈+0.003–0.005 at L2048, all others <0.001), confirming every conclusion from the
+  training-meta pass: homonymy penalty small/positive and ≪ H(S|W) (~+0.011 @0.5, ~+0.046 @1.5) and
+  **flat across L∈{512,1024,2048}**; overlap far below mono (gap ≈ −H(S|W), a floor confound). CORE/
+  sample blank by design (seed-noise caveat N/A — CORE never evaluated here). Closes prior next-step
+  #4; remaining next steps unchanged (short-L anchors, within-sequence probe, floor-relative overlap).
