@@ -12,6 +12,16 @@ import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
 
+# The fused optimizer kernels below are compiled with dynamic=False, so dynamo specializes one
+# variant per distinct *parameter shape* it is called with. A plain nanochat model already needs
+# 6 of dynamo's default budget of 8; any model with a few more distinct shapes (e.g. the
+# auxiliary gist-reconstruction head, which adds 4) blows the limit and the optimizer step dies
+# with FailOnRecompileLimitHit. Raise the budget — it only permits more compiled variants, it
+# never forces any.
+for _limit_attr in ("recompile_limit", "cache_size_limit"):  # renamed across torch versions
+    if hasattr(torch._dynamo.config, _limit_attr):
+        setattr(torch._dynamo.config, _limit_attr, max(32, getattr(torch._dynamo.config, _limit_attr)))
+
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.

@@ -86,6 +86,91 @@ def sentence_attention_experiments() -> list[dict]:
     return configs
 
 
+def gist_reconstruction_experiments() -> list[dict]:
+    """Gist-token reconstruction: does an auxiliary sentence-reconstruction loss make gists
+    better summaries? (experiments/gist-token-reconstruction-1.md)
+
+    Direct follow-up to `sentence_attention_experiments`, same architecture and protocol. In
+    sentence attention the K gist tokens emitted at each sentence boundary are the ONLY channel
+    through which information crosses sentence blocks, but nothing in the next-token objective
+    forces a gist to actually summarize its own sentence. This group adds an auxiliary loss that
+    does: from the K gist hidden states at a boundary, a small parallel (non-autoregressive)
+    head reconstructs the token ids of the sentence that just ended, and
+
+        total loss = next-token CE + lambda * reconstruction CE.
+
+    Ablation: K is FIXED at 4 (the middle of the K sweep in the sentence-attention experiment)
+    and the ONLY thing that varies across arms is lambda, over a ~1 order-of-magnitude ladder:
+
+      - `d12_gr_k4_w0p0` — lambda = 0. The internal control and the only arm the decision rule
+        compares against. At lambda = 0 base_train allocates NO reconstruction head at all, so
+        this arm is numerically the plain sentence-attention K=4 model (it should reproduce
+        `d12_sa_nltk_k4` from the sentence-attention experiment; running it here also serves as
+        an end-to-end check that the new flag is inert at 0).
+      - `d12_gr_k4_w0p1` / `d12_gr_k4_w0p5` / `d12_gr_k4_w1p0` — lambda in {0.1, 0.5, 1.0}.
+
+    The existing d12 full-causal `d12_sa_baseline` is the EXTERNAL reference and is deliberately
+    NOT relaunched here.
+
+    Metric purity (threat (a) in the plan): the auxiliary term is training-only. It is added to
+    the optimized objective and logged as train/gist_recon_loss + train/total_loss, but never
+    enters val loss / BPB / CORE, and the head is discarded when the checkpoint is loaded for
+    evaluation (checkpoint_manager.build_model), so it cannot inflate the reported metrics or
+    the evaluated parameter count.
+
+    All arms use --window-pattern L (isolates the sentence mechanism from the default
+    sliding-window pattern) and, as in the sentence-attention experiment, disable ALL
+    in-training evaluation/sampling (--eval-every / --core-metric-every / --sample-every = -1):
+    the 10k steps run uninterrupted and each model is scored exactly once at the end by the
+    post-training stage (run_evaluation.py -> base_eval.py) on CORE + BPB.
+    """
+    experiment_slug = "gist-token-reconstruction-1"
+    num_gpus = 4
+    instance_type = "a100.4gpu"
+    depth = 12
+    seed = 0
+    num_gist_tokens = 4  # K, fixed across every arm of this experiment
+
+    shared_args = [
+        f"--depth {depth}",
+        "--window-pattern L",
+        "--num-iterations 10000",
+        # No in-training evaluation: scoring happens only in the post-training stage.
+        "--eval-every -1",
+        "--core-metric-every -1",
+        "--sample-every -1",
+        # Sentence attention (identical for every arm).
+        "--gist-placement sentence_nltk",
+        f"--num-gist-tokens {num_gist_tokens}",
+        # Reconstruction span bound + position subsample. Stated explicitly on every arm
+        # (including the lambda=0 control, where they are inert) so the recorded command fully
+        # pins the auxiliary task; only --gist-recon-weight varies.
+        "--gist-recon-max-sentence-len 64",
+        "--gist-recon-stride 8",
+    ]
+
+    # (tag suffix, lambda). 0.0 = the internal control (no head allocated at all).
+    weights = [("w0p0", 0.0), ("w0p1", 0.1), ("w0p5", 0.5), ("w1p0", 1.0)]
+
+    configs = []
+    for tag, weight in weights:
+        args_parts = shared_args + [f"--gist-recon-weight {weight}", f"--seed {seed}"]
+        args_str = " ".join(args_parts).strip()
+        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+        model_tag = f"d{depth}_gr_k{num_gist_tokens}_{tag}"
+        role = "control (no aux head)" if weight == 0.0 else f"aux gist-reconstruction lambda={weight}"
+        configs.append({
+            "args": args_str,
+            "model_tag": model_tag,
+            "description": f"d12 sentence-attn K={num_gist_tokens} {role}, 10k steps",
+            "cmd_hash": cmd_hash,
+            "instance_type": instance_type,
+            "experiment_slug": experiment_slug,
+            "num_gpus": num_gpus,
+        })
+    return configs
+
+
 # ---------------------------------------------------------------------------
 # CLI and job submission
 # ---------------------------------------------------------------------------
@@ -152,6 +237,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     experiment_configs = [
         *sentence_attention_experiments(),
+        *gist_reconstruction_experiments(),
     ]
 
     for experiment_config in experiment_configs:

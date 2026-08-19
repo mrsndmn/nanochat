@@ -56,6 +56,10 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Sentence attention
 parser.add_argument("--gist-placement", type=str, default="none", choices=["none", "sentence_nltk", "uniform"], help="gist/end-of-sentence token insertion strategy (none=disabled; uniform reserved for follow-ups)")
 parser.add_argument("--num-gist-tokens", type=int, default=0, help="K gist tokens inserted per sentence boundary (0=disabled). Enables block-causal + global-gist sentence attention")
+# Auxiliary gist-reconstruction loss (experiments/gist-token-reconstruction-1.md)
+parser.add_argument("--gist-recon-weight", type=float, default=0.0, help="lambda for the auxiliary loss that reconstructs each sentence's token ids from its K gist hidden states. 0.0 (default) allocates NO head and leaves the training path numerically unchanged")
+parser.add_argument("--gist-recon-max-sentence-len", type=int, default=64, help="bound on the reconstruction span: tokens further than this from their sentence start get no reconstruction target")
+parser.add_argument("--gist-recon-stride", type=int, default=8, help="reconstruct every Nth token position (static-shape subsample). The aux loss is a mean over supervised positions, so this trades gradient variance for the head's extra (B, T/stride, vocab) logits memory/compute")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -155,6 +159,16 @@ else:
     vocab_size = real_vocab_size
 print0(f"Vocab size: {vocab_size:,}")
 
+# Auxiliary gist-reconstruction loss: enabled only for a strictly positive weight, and only
+# then is the head allocated at all. At weight 0.0 the model is bit-for-bit the sentence-attention
+# model (no extra parameters, no extra compute, no unused params for the distributed optimizer
+# to trip over), which is what keeps the lambda=0 control comparable to previously trained arms.
+gist_recon_enabled = args.gist_recon_weight > 0.0
+if gist_recon_enabled:
+    assert gist_token_ids_tuple, "--gist-recon-weight > 0 requires gist tokens (--gist-placement / --num-gist-tokens)"
+    assert args.gist_recon_max_sentence_len > 0 and args.gist_recon_stride > 0
+    print0(f"Gist reconstruction: weight={args.gist_recon_weight}, max_sentence_len={args.gist_recon_max_sentence_len}, stride={args.gist_recon_stride}")
+
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
@@ -172,6 +186,9 @@ def build_model_meta(depth):
         end_of_sentence_token_ids=gist_token_ids_tuple,
         full_attention_layers=(),
         bos_token_id=(tokenizer.get_bos_token_id() if gist_token_ids_tuple else -1),
+        gist_recon_enabled=gist_recon_enabled,
+        gist_recon_max_sentence_len=args.gist_recon_max_sentence_len,
+        gist_recon_stride=args.gist_recon_stride,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -447,7 +464,9 @@ if not resuming:
     min_val_bpb = float("inf")
     val_loss = None # nats/token over real tokens (fair metric under supervise-everything)
     min_val_loss = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
+    smooth_train_loss = 0 # EMA of training loss (pure next-token CE)
+    smooth_train_aux_loss = 0 # EMA of the auxiliary gist-reconstruction CE (0 when disabled)
+    smooth_train_total_loss = 0 # EMA of the optimized total (next-token + lambda * aux)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
@@ -458,6 +477,8 @@ else:
     val_loss = meta_data.get("val_loss")
     min_val_loss = loop_state.get("min_val_loss", float("inf"))
     smooth_train_loss = loop_state["smooth_train_loss"]
+    smooth_train_aux_loss = loop_state.get("smooth_train_aux_loss", 0)
+    smooth_train_total_loss = loop_state.get("smooth_train_total_loss", loop_state["smooth_train_loss"])
     total_training_time = loop_state["total_training_time"]
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
@@ -502,6 +523,8 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "min_val_loss": min_val_loss,
                     "smooth_train_loss": smooth_train_loss,
+                    "smooth_train_aux_loss": smooth_train_aux_loss,
+                    "smooth_train_total_loss": smooth_train_total_loss,
                     "total_training_time": total_training_time,
                 },
             },
@@ -579,13 +602,24 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
+        if gist_recon_enabled:
+            # Auxiliary objective: total = next-token CE + lambda * gist-reconstruction CE.
+            # `loss` stays the PURE next-token CE for logging/comparison; only `total_loss` is
+            # optimized. The head is fed every micro-step, so it never has a None grad.
+            loss, aux_loss = model(x, y, return_aux=True)
+            total_loss = loss + args.gist_recon_weight * aux_loss
         else:
-            loss.backward()
+            loss = model(x, y)
+            aux_loss = None
+            total_loss = loss
+        train_loss = loss.detach() # for logging (pure next-token CE)
+        train_aux_loss = aux_loss.detach() if aux_loss is not None else None
+        train_total_loss = total_loss.detach()
+        total_loss = total_loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        if scaler is not None:
+            scaler.scale(total_loss).backward()
+        else:
+            total_loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -609,7 +643,13 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    if gist_recon_enabled:
+        # one sync point for all three scalars instead of three
+        train_loss_f, train_aux_loss_f, train_total_loss_f = torch.stack([
+            train_loss.float(), train_aux_loss.float(), train_total_loss.float()]).tolist()
+    else:
+        train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+        train_aux_loss_f, train_total_loss_f = None, train_loss_f
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -618,7 +658,16 @@ while True:
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    debias = 1 - ema_beta**(step + 1)
+    debiased_smooth_loss = smooth_train_loss / debias # debias the EMA
+    if gist_recon_enabled:
+        smooth_train_aux_loss = ema_beta * smooth_train_aux_loss + (1 - ema_beta) * train_aux_loss_f
+        smooth_train_total_loss = ema_beta * smooth_train_total_loss + (1 - ema_beta) * train_total_loss_f
+        debiased_smooth_aux_loss = smooth_train_aux_loss / debias
+        debiased_smooth_total_loss = smooth_train_total_loss / debias
+        gist_recon_str = f" | recon: {debiased_smooth_aux_loss:.6f} | total: {debiased_smooth_total_loss:.6f}"
+    else:
+        gist_recon_str = ""
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -635,7 +684,7 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{gist_recon_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -648,6 +697,11 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if gist_recon_enabled:
+            # Logged separately from train/loss so the pure next-token curve stays comparable
+            # across arms and the auxiliary term can be inspected on its own.
+            log_data["train/gist_recon_loss"] = debiased_smooth_aux_loss
+            log_data["train/total_loss"] = debiased_smooth_total_loss
         run_logger.log(log_data)
         if job_progress is not None:
             job_progress.on_log(step=step, metrics={"train/loss": debiased_smooth_loss, "train/mfu": mfu})

@@ -31,6 +31,10 @@ def _patch_missing_config_keys(model_config_kwargs):
     model_config_kwargs.setdefault("end_of_sentence_token_ids", ())
     model_config_kwargs.setdefault("full_attention_layers", ())
     model_config_kwargs.setdefault("bos_token_id", -1)
+    # Auxiliary gist-reconstruction keys (absent in older checkpoints); disabled by default.
+    model_config_kwargs.setdefault("gist_recon_enabled", False)
+    model_config_kwargs.setdefault("gist_recon_max_sentence_len", 64)
+    model_config_kwargs.setdefault("gist_recon_stride", 8)
     # JSON round-trips tuples to lists; coerce back so the config holds tuples as declared.
     for _k in ("end_of_sentence_token_ids", "full_attention_layers"):
         if model_config_kwargs.get(_k) is not None:
@@ -103,6 +107,13 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
+    # The auxiliary gist-reconstruction head is TRAINING-ONLY: drop it here so evaluation and
+    # inference never allocate or require it (it must not affect val loss / bpb / CORE), and so
+    # that checkpoints trained with the head still load under strict=True.
+    if model_config_kwargs.get("gist_recon_enabled"):
+        log0("Discarding the training-only gist reconstruction head (not used at eval/inference)")
+    model_config_kwargs["gist_recon_enabled"] = False
+    model_data = {k: v for k, v in model_data.items() if not k.startswith("gist_recon.")}
     # Forward-compat across branches: drop any config keys this GPTConfig doesn't declare
     # (e.g. an experiment-specific field maintained only on another branch). Warn for visibility.
     import dataclasses as _dataclasses

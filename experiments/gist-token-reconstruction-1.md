@@ -109,3 +109,13 @@ _Pending._
   sentence-attention control at fixed K plus 2–3 arms of increasing reconstruction weight, at d12 /
   `--window-pattern L` / 10k steps / single seed (seed 0) / `a100.4gpu` (4 GPUs), with no
   in-training evaluation and a single end-of-training CORE + BPB scoring pass.
+- 2026-08-19: Implemented. Design decisions the plan left open (code is the source of truth —
+  `GistReconstructionHead` / `gist_reconstruction_targets` in `nanochat/gpt.py`): the head scores
+  against its **own** output projection, never `lm_head` (threat (b)); tokens in the **last
+  sentence of a document are skipped** (no boundary follows them, and attaching them to the next
+  document's boundary would leak across documents); gist tokens, BOS and ignore positions are
+  excluded from the targets; supervision is taken on a fixed strided subsample of positions
+  (`--gist-recon-stride`) and bounded by `--gist-recon-max-sentence-len`. `--gist-recon-weight 0`
+  allocates no head at all. The head is discarded when a checkpoint is loaded for eval/inference
+  (`checkpoint_manager.build_model`), so BPB/CORE stay pure next-token metrics (threat (a)).
+  No sentence-attention arm was relaunched.

@@ -47,6 +47,20 @@ class GPTConfig:
     # BOS token id: marked always-visible and used as the per-document segment delimiter for
     # the sentence mask (segment id = cumulative count of BOS tokens). -1 disables BOS handling.
     bos_token_id: int = -1
+    # Auxiliary gist-reconstruction head (experiments/gist-token-reconstruction-1.md).
+    # TRAINING-ONLY: the head is allocated ONLY when gist_recon_enabled is True, is never used
+    # by the next-token path (val loss / bpb / CORE / generate), and is discarded when a
+    # checkpoint is loaded for eval/inference (see checkpoint_manager.build_model).
+    # False => not a single extra parameter or FLOP, so arms trained before this existed stay
+    # bit-for-bit comparable.
+    gist_recon_enabled: bool = False
+    # Tokens further than this from the start of their sentence get no reconstruction target
+    # (bounds the reconstruction span; also the size of the within-sentence position table).
+    gist_recon_max_sentence_len: int = 64
+    # Reconstruct only every Nth token position (a static-shape subsample). The auxiliary loss
+    # is a mean over supervised positions, so the stride trades gradient variance for the
+    # memory/compute of the head's extra (B, T/stride, vocab) logits and does not rescale it.
+    gist_recon_stride: int = 8
 
 
 def norm(x):
@@ -88,6 +102,156 @@ def _closest_boundary_idx(gist_mask):
     last_prev = torch.roll(last_incl, 1, dims=1)                    # shift to "strictly before q"
     last_prev[:, 0] = 0
     return last_prev.long()
+
+
+def _next_boundary_idx(gist_mask):
+    """Mirror image of _closest_boundary_idx: for each position, the index of the closest
+    sentence boundary at-or-after it, or T if there is none. Same boundary definition (the LAST
+    token of each contiguous run of gist tokens), computed with a reverse cummin instead of a
+    forward cummax so it also stays a single vectorized on-GPU pass.
+    gist_mask: (B, T) bool. Returns (B, T) long with values in [0, T]."""
+    B, T = gist_mask.shape
+    nxt = torch.zeros_like(gist_mask)
+    nxt[:, :-1] = gist_mask[:, 1:]
+    at_boundary = gist_mask & ~nxt                                  # last token of each gist run
+    pos = torch.arange(T, device=gist_mask.device).unsqueeze(0).expand(B, -1)
+    bidx = torch.where(at_boundary, pos, torch.full_like(pos, T))   # T = "not a boundary"
+    flipped, _ = torch.cummin(torch.flip(bidx, [1]), dim=1)         # running min from the right
+    return torch.flip(flipped, [1]).long()
+
+
+def gist_reconstruction_targets(idx, targets, end_of_sentence_token_ids, bos_token_id,
+                                max_sentence_len, stride):
+    """Build the supervision for the auxiliary gist-reconstruction loss, fully vectorized and
+    on-device (no Python loops over the batch), reusing the same cummax/cummin boundary
+    machinery as the sentence mask.
+
+    Every real token t belongs to the sentence that is closed by the FIRST gist boundary at or
+    after t; that boundary's K gist tokens are the ones asked to reconstruct t. Positions are
+    subsampled with a fixed `stride` so all shapes are static (torch.compile friendly).
+
+    A position is EXCLUDED (target -1) when it is:
+      - a gist token (the gists are the encoder, never a reconstruction target),
+      - the BOS token (a document delimiter, not sentence content),
+      - an ignore/padding position (its next-token target is -1),
+      - in the LAST sentence of its document: that sentence emits no gist boundary at all (the
+        dataloader inserts gists *between* sentences only), so there is nothing to reconstruct
+        it from. We SKIP those tokens rather than attaching them to the next document's
+        boundary, which would leak across documents.
+      - further than `max_sentence_len` tokens from the start of its sentence (bounds the
+        reconstruction span; keeps the within-sentence position table small).
+
+    Args:
+        idx:      (B, T) input token ids
+        targets:  (B, T) next-token targets, only used for its -1 ignore positions
+        end_of_sentence_token_ids: the K gist ids
+        bos_token_id: BOS id, or -1 to disable document segmentation
+        max_sentence_len: reconstruction span bound (also the position-embedding table range)
+        stride:   subsample every `stride`-th position
+
+    Returns a tuple of:
+        sel:      (N,)   long, the selected (strided) query positions
+        boundary: (B, N) long, index of the gist boundary closing each selected token's
+                  sentence (clamped into range; meaningless where the target is -1)
+        rel:      (B, N) long, within-sentence offset of the selected token, in
+                  [0, max_sentence_len)
+        target:   (B, N) long, the token id to reconstruct, or -1 where excluded
+    """
+    B, T = idx.shape
+    device = idx.device
+    eos_ids = torch.tensor(end_of_sentence_token_ids, device=device)
+    gist_mask = (idx.unsqueeze(-1) == eos_ids).any(-1)              # (B, T) gist positions
+    pos = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+
+    # The boundary that closes this token's sentence (T where there is none to the right).
+    nxt_b = _next_boundary_idx(gist_mask)                           # (B, T)
+    has_b = nxt_b < T
+    nxt_b_safe = nxt_b.clamp(max=T - 1)
+
+    # Document segmentation + the position of the BOS that opens each token's document.
+    if bos_token_id >= 0:
+        is_bos = idx == bos_token_id
+        seg = is_bos.cumsum(dim=1)                                  # document id within the row
+        same_doc = seg.gather(1, nxt_b_safe) == seg                 # boundary in the same doc?
+        doc_start, _ = torch.cummax(torch.where(is_bos, pos, torch.zeros_like(pos)), dim=1)
+    else:
+        is_bos = torch.zeros_like(gist_mask)
+        same_doc = torch.ones_like(has_b)
+        doc_start = torch.zeros_like(pos)
+
+    # Sentence start = just after the previous boundary, clipped to the document start (so the
+    # first sentence of a packed document never inherits the previous document's boundary).
+    prev_b = _closest_boundary_idx(gist_mask)                       # (B, T)
+    sent_start = torch.maximum(prev_b + 1, doc_start + 1)
+    rel = pos - sent_start
+
+    valid = (~gist_mask) & (~is_bos) & has_b & same_doc & (rel >= 0) & (rel < max_sentence_len)
+    valid = valid & (targets >= 0)
+
+    # Static-shape subsample of query positions.
+    sel = torch.arange(0, T, stride, device=device)
+    boundary = nxt_b_safe.index_select(1, sel)
+    rel_sel = rel.index_select(1, sel).clamp_(0, max_sentence_len - 1)
+    valid_sel = valid.index_select(1, sel)
+    target = torch.where(valid_sel, idx.index_select(1, sel), torch.full_like(boundary, -1))
+    return sel, boundary, rel_sel, target
+
+
+class GistReconstructionHead(nn.Module):
+    """Auxiliary, TRAINING-ONLY head: reconstruct the token ids of a sentence from the K gist
+    hidden states emitted at that sentence's boundary.
+
+    Design (see experiments/gist-token-reconstruction-1.md):
+    - Parallel / non-autoregressive. Each real token of the sentence is predicted independently
+      from (its boundary's gist states, its within-sentence position), so the whole auxiliary
+      objective is one extra matmul + cross-entropy, with no sequential decode.
+    - The K gist states are CONCATENATED rather than pooled: the gist run always has exactly K
+      tokens (the dataloader inserts K), and concatenation lets the head exploit their ordering
+      (later gists in a run see more of the sentence than earlier ones).
+    - Scored against its OWN output projection, deliberately NOT the model's lm_head. The plan
+      requires the auxiliary objective to never touch the next-token path: sharing lm_head
+      weights would add an extra gradient path into the next-token predictor and change its
+      effective capacity, which would be a different (confounded) experiment.
+    - Deliberately shallow (one projection + one MLP block). A deep decoder could solve the
+      reconstruction task by itself; keeping it shallow pushes the pressure onto the gist
+      representations, which is the thing the hypothesis is about.
+    """
+
+    def __init__(self, config, padded_vocab_size):
+        super().__init__()
+        n_embd = config.n_embd
+        self.num_gist = len(config.end_of_sentence_token_ids)
+        assert self.num_gist > 0, "gist reconstruction requires gist tokens (sentence attention)"
+        # Pad the position table's leading dim to a multiple of 64: DistMuonAdamW reduce_scatters
+        # any param with numel >= 1024 along dim 0 and requires shape[0] % world_size == 0.
+        self.pos_table_size = ((config.gist_recon_max_sentence_len + 63) // 64) * 64
+        self.gist_proj = Linear(self.num_gist * n_embd, n_embd, bias=False)
+        self.pos_emb = nn.Embedding(self.pos_table_size, n_embd)
+        self.c_fc = Linear(n_embd, 2 * n_embd, bias=False)
+        self.c_proj = Linear(2 * n_embd, n_embd, bias=False)
+        self.out = Linear(n_embd, padded_vocab_size, bias=False)
+
+    @torch.no_grad()
+    def init_weights(self):
+        n_embd = self.gist_proj.out_features
+        fan_in = self.gist_proj.in_features
+        torch.nn.init.uniform_(self.gist_proj.weight, -(3**0.5) * fan_in**-0.5, (3**0.5) * fan_in**-0.5)
+        torch.nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.8)  # like wte, it feeds a norm
+        s = 3**0.5 * n_embd**-0.5
+        torch.nn.init.uniform_(self.c_fc.weight, -s * 0.4, s * 0.4)
+        torch.nn.init.zeros_(self.c_proj.weight)   # zero-init residual branch, as in the trunk
+        torch.nn.init.normal_(self.out.weight, mean=0.0, std=0.001)  # like lm_head
+
+    def forward(self, gists, rel_pos):
+        """gists: (B, N, num_gist * n_embd), rel_pos: (B, N) long -> logits (B, N, padded_vocab)."""
+        h = self.gist_proj(gists) + self.pos_emb(rel_pos).to(gists.dtype)
+        h = norm(h)
+        # The nonlinearity is what makes the prediction depend on (content x position) jointly;
+        # a purely additive content+position mix would give every position of a sentence the
+        # same distribution up to a position bias.
+        h = h + self.c_proj(F.relu(self.c_fc(h)).square())
+        return self.out(norm(h))
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -225,6 +389,10 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Auxiliary gist-reconstruction head (training-only, opt-in). Constructed LAST so that
+        # with the same seed the trunk/lm_head/value-embed init is bit-identical whether or not
+        # the head exists (see also init_weights, which inits it last for the same reason).
+        self.gist_recon = GistReconstructionHead(config, padded_vocab_size) if config.gist_recon_enabled else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -295,6 +463,12 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # Auxiliary gist-reconstruction head, initialized LAST so that everything above draws
+        # exactly the same random numbers with or without the head (the lambda=0 control and a
+        # lambda>0 arm therefore start from identical trunk weights for a given seed).
+        if self.gist_recon is not None:
+            self.gist_recon.init_weights()
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -405,9 +579,14 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        # Also exclude the auxiliary gist-reconstruction head: it is training-only and discarded
+        # at eval, so this metric keeps describing the model that is actually deployed/scored
+        # and stays directly comparable to the lambda=0 control.
+        gist_recon_numel = sum(p.numel() for p in self.gist_recon.parameters()) if self.gist_recon is not None else 0
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() +
+                          gist_recon_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -436,7 +615,11 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        # Reported in its own bucket and NOT folded into any of the buckets used for scaling
+        # (base_train uses transformer_matrices + lm_head), so enabling the training-only
+        # auxiliary head cannot shift the auto-computed batch size / training horizon.
+        gist_recon = sum(p.numel() for p in self.gist_recon.parameters()) if self.gist_recon is not None else 0
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + gist_recon
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -444,6 +627,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'gist_recon': gist_recon,
             'total': total,
         }
 
@@ -459,7 +643,11 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        # Auxiliary gist-reconstruction head: kept in its own AdamW group(s) so the trunk's Muon
+        # groups (and hence the lambda=0 control's optimizer state layout) are untouched.
+        recon_out_params = [self.gist_recon.out.weight] if self.gist_recon is not None else []
+        recon_body_params = [p for n, p in self.gist_recon.named_parameters() if n != "out.weight"] if self.gist_recon is not None else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(recon_out_params) + len(recon_body_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -475,6 +663,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # Auxiliary head groups (only present when the head is allocated): the vocab projection
+        # is treated like lm_head, the rest like ordinary AdamW matrices.
+        if recon_out_params:
+            param_groups.append(dict(kind='adamw', params=recon_out_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01))
+            param_groups.append(dict(kind='adamw', params=recon_body_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.01))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -489,7 +682,43 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def _gist_recon_loss(self, x, idx, targets):
+        """Auxiliary loss: reconstruct each sentence's token ids from the K gist hidden states
+        emitted at that sentence's boundary. Training-only; see GistReconstructionHead.
+
+        x: (B, T, C) FINAL hidden states (the same tensor lm_head consumes). Only the gist
+        positions of x are read, so the auxiliary gradient enters the trunk exclusively through
+        the gist representations. Returns a scalar mean CE over the supervised positions.
+        """
+        head = self.gist_recon
+        cfg = self.config
+        B, T = idx.shape
+        C = x.size(-1)
+        K = head.num_gist
+        sel, boundary, rel, target = gist_reconstruction_targets(
+            idx, targets, cfg.end_of_sentence_token_ids, cfg.bos_token_id,
+            cfg.gist_recon_max_sentence_len, cfg.gist_recon_stride,
+        )
+        N = sel.numel()
+        # The K gist tokens of a boundary occupy [boundary-K+1, boundary]; gather their states.
+        offsets = torch.arange(K - 1, -1, -1, device=idx.device)         # K-1, ..., 1, 0
+        gist_idx = (boundary.unsqueeze(-1) - offsets).clamp(min=0)       # (B, N, K)
+        gists = x.gather(1, gist_idx.reshape(B, N * K, 1).expand(-1, -1, C)).reshape(B, N, K * C)
+        # NOTE: no slicing to vocab_size here (unlike lm_head). The padded columns are never
+        # targets, they just learn a low logit, and skipping the slice avoids materializing a
+        # second (B, N, padded_vocab) tensor.
+        logits = head(gists, rel).float()
+        # reduction='sum' / count instead of reduction='mean' so an all-masked micro-batch
+        # yields 0 instead of NaN, with no data-dependent control flow (torch.compile safe).
+        loss_sum = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1), ignore_index=-1, reduction='sum')
+        num_supervised = (target >= 0).sum()
+        return loss_sum / num_supervised.clamp(min=1)
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_aux=False):
+        """return_aux=True additionally computes the auxiliary gist-reconstruction loss and
+        returns (next_token_loss, aux_loss). It is opt-in and used ONLY by the training loop:
+        every reported metric (val loss, bpb, CORE) goes through the default return_aux=False
+        path and therefore stays a pure next-token metric that never touches the aux head."""
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -558,6 +787,16 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_aux:
+                # Auxiliary reconstruction is training-only: it needs the full sequence (no
+                # kv-cache) and the input ids, and it is skipped entirely when the head is
+                # absent (gist_recon_weight == 0) — in which case the loss above is bit-for-bit
+                # the pre-existing computation and a zero constant is returned for logging.
+                if self.gist_recon is not None and kv_cache is None:
+                    aux_loss = self._gist_recon_loss(x, idx, targets)
+                else:
+                    aux_loss = torch.zeros((), dtype=torch.float32, device=idx.device)
+                return loss, aux_loss
             return loss
         else:
             # inference: just return the logits directly
