@@ -104,16 +104,30 @@ def _closest_boundary_idx(gist_mask):
     return last_prev.long()
 
 
-def _next_boundary_idx(gist_mask):
+def _next_boundary_idx(gist_mask, run_len=1):
     """Mirror image of _closest_boundary_idx: for each position, the index of the closest
     sentence boundary at-or-after it, or T if there is none. Same boundary definition (the LAST
     token of each contiguous run of gist tokens), computed with a reverse cummin instead of a
     forward cummax so it also stays a single vectorized on-GPU pass.
+
+    run_len > 1 additionally requires the run to be COMPLETE, i.e. all `run_len` positions
+    [b-run_len+1, b] are gist tokens. This matters for the reconstruction head, which reads
+    exactly those K states: the best-fit dataloader crops the last document of a packed row at
+    an arbitrary offset, so a row can end mid-gist-run. Without this check the truncated run
+    would still register as a boundary and the head's gather would reach past the run's start
+    into the SENTENCE'S OWN token states — letting it read the target token's representation to
+    predict that token. The loop is over the static config constant K (never over B/T), so it
+    adds no data-dependent shapes and stays torch.compile friendly.
+
     gist_mask: (B, T) bool. Returns (B, T) long with values in [0, T]."""
     B, T = gist_mask.shape
     nxt = torch.zeros_like(gist_mask)
     nxt[:, :-1] = gist_mask[:, 1:]
     at_boundary = gist_mask & ~nxt                                  # last token of each gist run
+    for k in range(1, run_len):                                     # static, K is a config const
+        shifted = torch.zeros_like(gist_mask)
+        shifted[:, k:] = gist_mask[:, :-k]
+        at_boundary = at_boundary & shifted                         # ... and the run is complete
     pos = torch.arange(T, device=gist_mask.device).unsqueeze(0).expand(B, -1)
     bidx = torch.where(at_boundary, pos, torch.full_like(pos, T))   # T = "not a boundary"
     flipped, _ = torch.cummin(torch.flip(bidx, [1]), dim=1)         # running min from the right
@@ -138,6 +152,9 @@ def gist_reconstruction_targets(idx, targets, end_of_sentence_token_ids, bos_tok
         dataloader inserts gists *between* sentences only), so there is nothing to reconstruct
         it from. We SKIP those tokens rather than attaching them to the next document's
         boundary, which would leak across documents.
+      - closed only by an INCOMPLETE gist run (a row cropped mid-run by the best-fit
+        dataloader): fewer than K gist states exist, so the head's gather would read the
+        sentence's own token states. See `_next_boundary_idx(..., run_len=K)`.
       - further than `max_sentence_len` tokens from the start of its sentence (bounds the
         reconstruction span; keeps the within-sentence position table small).
 
@@ -164,7 +181,9 @@ def gist_reconstruction_targets(idx, targets, end_of_sentence_token_ids, bos_tok
     pos = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
 
     # The boundary that closes this token's sentence (T where there is none to the right).
-    nxt_b = _next_boundary_idx(gist_mask)                           # (B, T)
+    # run_len=K: only a COMPLETE run of K gist tokens counts, so the K states the head gathers
+    # at [b-K+1, b] are always gists and never the sentence's own token states.
+    nxt_b = _next_boundary_idx(gist_mask, run_len=len(end_of_sentence_token_ids))  # (B, T)
     has_b = nxt_b < T
     nxt_b_safe = nxt_b.clamp(max=T - 1)
 

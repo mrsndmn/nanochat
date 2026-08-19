@@ -119,3 +119,11 @@ _Pending._
   allocates no head at all. The head is discarded when a checkpoint is loaded for eval/inference
   (`checkpoint_manager.build_model`), so BPB/CORE stay pure next-token metrics (threat (a)).
   No sentence-attention arm was relaunched.
+- 2026-08-19: Review fix — a sentence closed only by an **incomplete gist run** is now excluded
+  too. The best-fit dataloader crops the last document of a packed row at an arbitrary offset,
+  so a row can end mid-gist-run; that partial run still registered as a boundary, and the head's
+  fixed K-state gather then reached past the run's start into the **sentence's own token
+  states** — i.e. it could predict a target token from that token's own hidden state.
+  Reconstruction boundaries now require the complete K-token run
+  (`_next_boundary_idx(..., run_len=K)`). The sentence-attention mask's boundary notion is
+  unchanged, so the `lambda = 0` path stays bit-identical.

@@ -122,11 +122,12 @@ def _reference_targets(idx, targets, gist_ids, bos_id, max_len, stride):
     """Independent brute-force reference for gist_reconstruction_targets.
 
     For every position t: find the first gist boundary at-or-after t (a boundary = the last
-    token of a contiguous gist run). t is supervised iff it is a real token (not a gist, not
-    BOS), not an ignore position, that boundary exists and lies in the same document, and t is
-    within max_len tokens of the start of its sentence.
+    token of a COMPLETE run of K = len(gist_ids) gist tokens). t is supervised iff it is a real
+    token (not a gist, not BOS), not an ignore position, that boundary exists and lies in the
+    same document, and t is within max_len tokens of the start of its sentence.
     """
     gist_set = set(gist_ids)
+    K = len(gist_ids)
     B, T = idx.shape
     sel = list(range(0, T, stride))
     boundary_out, rel_out, target_out = [], [], []
@@ -134,7 +135,12 @@ def _reference_targets(idx, targets, gist_ids, bos_id, max_len, stride):
         tok = [int(idx[b, t]) for t in range(T)]
         is_gist = [x in gist_set for x in tok]
         is_bos = [bos_id >= 0 and x == bos_id for x in tok]
-        boundary = [is_gist[t] and not (t + 1 < T and is_gist[t + 1]) for t in range(T)]
+        run_end = [is_gist[t] and not (t + 1 < T and is_gist[t + 1]) for t in range(T)]
+        # A reconstruction boundary must additionally have its full K-token run present.
+        boundary = [
+            run_end[t] and t - K + 1 >= 0 and all(is_gist[p] for p in range(t - K + 1, t + 1))
+            for t in range(T)
+        ]
         seg, c = [], 0
         for t in range(T):
             if is_bos[t]:
@@ -148,10 +154,11 @@ def _reference_targets(idx, targets, gist_ids, bos_id, max_len, stride):
                 if boundary[p]:
                     nb = p
                     break
-            # start of t's sentence: after the previous boundary, but not before the doc start
+            # start of t's sentence: after the previous run end (the mask's boundary notion,
+            # complete or not), but not before the doc start
             prev_b = 0
             for p in range(t):
-                if boundary[p]:
+                if run_end[p]:
                     prev_b = p
             doc_start = 0
             for p in range(t + 1):
@@ -196,8 +203,10 @@ class TestBoundaryMachinery:
             [1, 7, 8, 50, 51, 9, 10, 11, 50, 51, 12, 13],
             # two docs packed in one row (second BOS at position 6)
             [1, 2, 50, 51, 3, 4, 1, 6, 7, 50, 51, 8],
+            # row cropped mid-gist-run: the trailing run has only 1 of the K=2 gists
+            [1, 2, 3, 50, 51, 4, 5, 6, 7, 8, 9, 50],
         ])
-        targets = torch.cat([idx[:, 1:], torch.full((2, 1), -1)], dim=1)
+        targets = torch.cat([idx[:, 1:], torch.full((3, 1), -1)], dim=1)
         max_len = 8
         sel, boundary, rel, target = gist_reconstruction_targets(
             idx, targets, gist_ids, bos, max_len, stride)
@@ -264,6 +273,32 @@ class TestBoundaryMachinery:
         # sentence starts at position 1, so only positions 1..4 (rel 0..3) are supervised
         assert [p for p in range(idx.shape[1]) if target[0, p] >= 0] == [1, 2, 3, 4]
         assert rel[0, 1:5].tolist() == [0, 1, 2, 3]
+
+    def test_truncated_gist_run_is_not_a_boundary(self):
+        """The best-fit dataloader crops the last document of a packed row at an arbitrary
+        offset, so a row can end in the MIDDLE of a K-token gist run. Such a partial run must
+        not count as a boundary: the head gathers the K states at [b-K+1, b], and with fewer
+        than K gists there it would read the sentence's OWN token states -- i.e. predict a
+        target token from its own hidden state. Regression test for that leak.
+        """
+        gist_ids = (50, 51, 52, 53)  # K = 4
+        bos, K = 1, 4
+        # full run ending at 7; then a run truncated to 2 gists at the end of the row
+        idx = torch.tensor([[bos, 7, 8, 9, 50, 51, 52, 53, 20, 21, 50, 51]])
+        targets = torch.cat([idx[:, 1:], torch.full((1, 1), -1)], dim=1)
+        _, boundary, _, target = gist_reconstruction_targets(idx, targets, gist_ids, bos, 32, 1)
+        # the sentence closed by the COMPLETE run is still supervised
+        assert (target[0, 1:4] >= 0).all() and boundary[0, 1:4].tolist() == [7, 7, 7]
+        # the sentence closed only by the truncated run gets no supervision at all
+        assert target[0, 8].item() == -1 and target[0, 9].item() == -1
+        # ... and no supervised position ever reads a non-gist state
+        gist_set = set(gist_ids)
+        offsets = torch.arange(K - 1, -1, -1)
+        gathered = (boundary.unsqueeze(-1) - offsets).clamp(min=0)
+        for p in range(idx.shape[1]):
+            if target[0, p] >= 0:
+                read = [int(idx[0, j]) for j in gathered[0, p].tolist()]
+                assert all(tok in gist_set for tok in read), f"pos {p} reads non-gist states {read}"
 
     def test_boundary_points_at_the_gist_run_end(self):
         gist_ids = (50, 51, 52, 53)  # K = 4
