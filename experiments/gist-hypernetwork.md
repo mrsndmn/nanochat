@@ -50,3 +50,7 @@ _Pending._
   gated+forced two-arm design). Implemented `GistHypernet` (masked cross-attention, per-slot
   zero-init alpha gates, nonzero c_proj init per the dead-path lesson) + experiment configs +
   tests. TTT gist refinement explicitly deferred pending this round's outcome.
+- 2026-08-27: Submitted both training jobs from branch `experiment/gist-hypernetwork-1`
+  (commit `cb02a09`):
+  - `d12_sa_nltk_k8_hnet_gated` → `lm-mpi-job-30b3a922-9b55-471a-ab09-9df09482b27f`
+  - `d12_sa_nltk_k8_hnet_forced` → `lm-mpi-job-5a858e88-261b-43c9-94cb-a897797eb153`
