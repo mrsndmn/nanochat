@@ -38,11 +38,43 @@ the deferred test-time-training follow-up.
 
 ## Results
 
-_Pending — to be filled after the post-training evaluation stage completes._
+End-of-training (step 10000) evaluation, val BPB (primary) and CORE (reference-only):
+
+| Arm | val BPB | Δ vs control | CORE (mean over 5 eval seeds) |
+|-----|---------|--------------|-------------------------------|
+| control `d12_sa_nltk_k8` (fixed gists) | 0.81906 | — | 0.1435 |
+| `hnet_gated` | 0.81826 | −0.00080 | 0.1464 ± 0.0018 |
+| `hnet_forced` | 0.81863 | −0.00043 | — |
+
+- **Win gate (≤ 0.8161, i.e. −0.003) NOT met.** The gated delta (−0.0008) is below even the
+  −0.001 iterate-signal threshold; both deltas sit in the range static-init tweaks reached.
+- **Mechanistic readout — the gate OPENED**: final per-slot alphas from the gated checkpoint
+  are far from zero: `[0.995, 1.169, 1.796, 1.044, 0.809, −1.218, −0.674, −1.466]`
+  (mean |α| = 1.15). The model actively consumed the content channel.
+- **Forced ≈ control** (−0.0004): pure content-conditioned embeddings with no fixed-row
+  fallback lose nothing — the content channel is fully *sufficient*, not harmful.
 
 ## Conclusions
 
-_Pending._
+**Null, with a sharp mechanism story: content-conditioned gist input embeddings are USED but
+REDUNDANT.** The alpha readout rules out the "gate stayed shut" null mode (ADR 0002): the
+model wired the hypernetwork in at full strength, and the forced arm shows sentence-content
+embeddings alone suffice — yet neither moves BPB beyond noise. The natural reading is that in
+the strict regime the trunk's own attention already writes the sentence's content into gist
+positions (gist queries see their whole sentence block across 12 layers), so injecting the
+same information at the input adds nothing the model couldn't compute. The strict-regime gap
+to full causal (~0.017 BPB) therefore does not live in gist *input content*; it lives
+elsewhere (gist channel bandwidth K, or block-causality itself).
+
+**Implication for the deferred TTT follow-up:** TTT gist refinement would inject
+gradient-computed content into this same input channel. With amortized content already shown
+redundant, input-level TTT is a low-odds bet at this regime and should not proceed as
+designed; a TTT variant would need to target a different bottleneck (e.g. refining deeper
+gist KV states, not input embeddings).
+
+Next steps considered: (a) close the strict-regime gap via channel capacity (wider gist
+bandwidth / windows) rather than content; (b) port nothing to the alt regime — with gists
+barely load-bearing there, a redundant-content mechanism has even less room.
 
 ## Changelog
 
@@ -54,3 +86,9 @@ _Pending._
   (commit `cb02a09`):
   - `d12_sa_nltk_k8_hnet_gated` → `lm-mpi-job-30b3a922-9b55-471a-ab09-9df09482b27f`
   - `d12_sa_nltk_k8_hnet_forced` → `lm-mpi-job-5a858e88-261b-43c9-94cb-a897797eb153`
+- 2026-08-28: Both training jobs completed (~3h45m each, error_code 0); step-10000
+  checkpoints verified on disk. Eval jobs submitted and completed
+  (`lm-mpi-job-283ab0b3-5ac6-4d77-b1ff-79b595398078` gated,
+  `lm-mpi-job-b5f7bb10-22b9-428c-a353-a446e09db555` forced). Results + conclusions
+  recorded: NULL vs the −0.003 win gate; alpha gates open (mean |α|=1.15) ⇒ content
+  channel used-but-redundant; input-level TTT follow-up deprioritized.
