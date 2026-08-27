@@ -56,6 +56,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Sentence attention
 parser.add_argument("--gist-placement", type=str, default="none", choices=["none", "sentence_nltk", "uniform"], help="gist/end-of-sentence token insertion strategy (none=disabled; uniform reserved for follow-ups)")
 parser.add_argument("--num-gist-tokens", type=int, default=0, help="K gist tokens inserted per sentence boundary (0=disabled). Enables block-causal + global-gist sentence attention")
+parser.add_argument("--gist-hypernet", type=str, default="none", choices=["none", "gated", "forced"], help="content-conditioned gist embeddings: gated=fixed row + alpha*h(sentence) (alpha zero-init), forced=h(sentence) outright. Requires gist tokens")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -153,6 +154,9 @@ if args.gist_placement != "none" and args.num_gist_tokens > 0:
     print0(f"Sentence attention: {args.num_gist_tokens} gist tokens (ids {gist_token_ids_tuple[0]}..{gist_token_ids_tuple[-1]}), placement={args.gist_placement}")
 else:
     vocab_size = real_vocab_size
+if args.gist_hypernet != "none":
+    assert gist_token_ids_tuple, "--gist-hypernet requires --gist-placement and --num-gist-tokens > 0"
+    print0(f"Gist hypernetwork: mode={args.gist_hypernet}")
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -172,6 +176,7 @@ def build_model_meta(depth):
         end_of_sentence_token_ids=gist_token_ids_tuple,
         full_attention_layers=(),
         bos_token_id=(tokenizer.get_bos_token_id() if gist_token_ids_tuple else -1),
+        gist_hypernet=args.gist_hypernet,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

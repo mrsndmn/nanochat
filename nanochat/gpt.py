@@ -47,6 +47,12 @@ class GPTConfig:
     # BOS token id: marked always-visible and used as the per-document segment delimiter for
     # the sentence mask (segment id = cumulative count of BOS tokens). -1 disables BOS handling.
     bos_token_id: int = -1
+    # Gist hypernetwork: content-conditioned gist embeddings (requires gist tokens).
+    #   "none"   -> fixed learned gist embedding rows (baseline sentence attention)
+    #   "gated"  -> gist embedding = wte row + alpha_k * h(sentence), per-slot alpha zero-init
+    #               (bit-exact equal to "none" at init)
+    #   "forced" -> gist embedding = h(sentence) outright (no fixed-row fallback, no gate)
+    gist_hypernet: str = "none"
 
 
 def norm(x):
@@ -88,6 +94,67 @@ def _closest_boundary_idx(gist_mask):
     last_prev = torch.roll(last_incl, 1, dims=1)                    # shift to "strictly before q"
     last_prev[:, 0] = 0
     return last_prev.long()
+
+def _gist_cross_attn_mask(idx, gist_start, bos_token_id):
+    """Boolean (B, 1, T, T) mask (True = attend) for the gist hypernetwork's cross-attention.
+
+    A query position q may attend key k iff k is a real token (not gist, not BOS) of q's own
+    sentence — same closest-boundary index as q — causally at-or-before q and within the same
+    document. Gist ids are detected by range test (id >= gist_start), valid because the gist
+    ids sit contiguously at the top of the vocab. The diagonal is forced True so no query row
+    is fully masked (SDPA turns empty rows into NaNs); for a gist query the self key only
+    re-injects its constant slot embedding.
+    """
+    B, T = idx.shape
+    device = idx.device
+    gist_mask = idx >= gist_start
+    special_mask = gist_mask.clone()
+    if bos_token_id >= 0:
+        special_mask |= idx == bos_token_id
+    eos_idx = _closest_boundary_idx(gist_mask)                      # (B, T)
+    same_sent = eos_idx.unsqueeze(2) == eos_idx.unsqueeze(1)        # (B, T, T)
+    q = torch.arange(T, device=device).view(1, T, 1)
+    k = torch.arange(T, device=device).view(1, 1, T)
+    allowed = same_sent & (k <= q) & ~special_mask.view(B, 1, T)
+    if bos_token_id >= 0:
+        seg = (idx == bos_token_id).cumsum(dim=1)                   # (B, T) document id within row
+        allowed = allowed & (seg.unsqueeze(2) == seg.unsqueeze(1))  # confine per-document
+    allowed = allowed | torch.eye(T, dtype=torch.bool, device=device).view(1, T, T)
+    return allowed.unsqueeze(1)                                     # (B, 1, T, T) bool
+
+
+class GistHypernet(nn.Module):
+    """Content-conditioned gist embeddings ("gated"/"forced" arms of the gist-hypernetwork
+    experiment).
+
+    One masked cross-attention pass over the full sequence: each of the K gist slots owns a
+    learned query vector (already in projected-Q space — a learned input times a learned
+    projection would be redundant), which attends over the wte embeddings of the query's own
+    completed sentence and produces a content embedding h per gist position. "gated" applies
+    wte_row + alpha_k * h with per-slot scalar gates alpha zero-init, so the model is
+    bit-exact equal to the fixed-gist arm at init; "forced" replaces the gist embedding with
+    h outright.
+
+    The output projection uses standard nonzero init on purpose: with alpha=0 the gate
+    already silences the path, and a zero-init projection on top of a zero gate would have
+    zero gradient everywhere (dead path).
+    """
+    def __init__(self, config):
+        super().__init__()
+        assert config.gist_hypernet in ("gated", "forced"), f"invalid gist_hypernet: {config.gist_hypernet}"
+        ids = config.end_of_sentence_token_ids
+        assert ids == tuple(range(min(ids), min(ids) + len(ids))), "gist ids must be contiguous (slot = id - gist_start)"
+        self.mode = config.gist_hypernet
+        self.gist_start = min(ids)
+        self.num_slots = len(ids)
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.queries = nn.Parameter(torch.empty(self.num_slots, self.n_head * self.head_dim))
+        self.c_k = Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_v = Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_proj = Linear(config.n_embd, config.n_embd, bias=False)
+        self.alphas = nn.Parameter(torch.zeros(self.num_slots)) if self.mode == "gated" else None
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -197,6 +264,9 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        assert config.gist_hypernet in ("none", "gated", "forced"), f"invalid gist_hypernet: {config.gist_hypernet}"
+        if config.gist_hypernet != "none":
+            assert config.end_of_sentence_token_ids, "gist_hypernet requires gist tokens (end_of_sentence_token_ids)"
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -225,6 +295,8 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Sentence attention: optional content-conditioned gist embeddings (see GistHypernet).
+        self.gist_hypernet = GistHypernet(config) if config.gist_hypernet != "none" else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -295,6 +367,17 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # Gist hypernetwork: queries/projections get standard nonzero init, per-slot gates zero.
+        # c_proj deliberately NOT zero: alphas=0 already silences the gated path, and zero-init
+        # on top of a zero gate would freeze it (zero gradient everywhere).
+        if self.gist_hypernet is not None:
+            torch.nn.init.uniform_(self.gist_hypernet.queries, -s, s)
+            torch.nn.init.uniform_(self.gist_hypernet.c_k.weight, -s, s)
+            torch.nn.init.uniform_(self.gist_hypernet.c_v.weight, -s, s)
+            torch.nn.init.uniform_(self.gist_hypernet.c_proj.weight, -s, s)
+            if self.gist_hypernet.alphas is not None:
+                torch.nn.init.zeros_(self.gist_hypernet.alphas)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -390,6 +473,39 @@ class GPT(nn.Module):
         allowed = allowed | torch.eye(T, dtype=torch.bool, device=device).view(1, T, T)  # self always
         return allowed.unsqueeze(1)                                     # (B, 1, T, T) bool
 
+    def _apply_gist_hypernet(self, x, idx, cos_sin):
+        """Compute content embeddings h for all positions with one masked cross-attention pass
+        over the raw wte embeddings, then apply them at gist positions only ("gated": fixed row
+        + alpha_k * h; "forced": h outright). Non-gist positions are returned unchanged.
+        x: (B, T, C) raw (pre-norm) wte embeddings in compute dtype."""
+        hn = self.gist_hypernet
+        B, T, C = x.size()
+        mask = _gist_cross_attn_mask(idx, hn.gist_start, self.config.bos_token_id)
+        # Slot index per position: gist ids sit at the top of the vocab, so idx - gist_start is
+        # the slot for gist positions and negative elsewhere; clamp pre-reduces the gather index
+        # (non-gist rows read slot 0 and are discarded by the torch.where below).
+        slot = (idx - hn.gist_start).clamp(min=0)
+        q = hn.queries.to(x.dtype)[slot].view(B, T, hn.n_head, hn.head_dim)
+        xn = norm(x)
+        k = hn.c_k(xn).view(B, T, hn.n_head, hn.head_dim)
+        v = hn.c_v(xn).view(B, T, hn.n_head, hn.head_dim)
+        # Same rotary + QK-norm + sharpening treatment as the trunk attention, so key/query
+        # geometry (relative distance to the sentence boundary) matches model idiom.
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
+        q = q * 1.2
+        k = k * 1.2
+        qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B, H, T, D)
+        y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        h = hn.c_proj(y)
+        gist_pos = (idx >= hn.gist_start).unsqueeze(-1)  # (B, T, 1)
+        if hn.mode == "gated":
+            alpha = hn.alphas.to(x.dtype)[slot].unsqueeze(-1)  # (B, T, 1)
+            return torch.where(gist_pos, x + alpha * h, x)
+        return torch.where(gist_pos, h, x)
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -408,6 +524,11 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+        if self.gist_hypernet is not None:
+            # queries/alphas are lookups/scalars, not matmuls
+            nparams_exclude += self.gist_hypernet.queries.numel()
+            if self.gist_hypernet.alphas is not None:
+                nparams_exclude += self.gist_hypernet.alphas.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -415,6 +536,8 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
+        if self.gist_hypernet is not None:
+            attn_flops += 12 * h * q * t  # one extra full-context cross-attention pass
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token
 
@@ -436,7 +559,11 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        # NOTE: gist_hypernet is kept OUT of transformer_matrices on purpose — base_train derives
+        # the training horizon / batch size from transformer_matrices + lm_head, and the hypernet
+        # arms must train under the exact same schedule as their fixed-gist control.
+        gist_hypernet = sum(p.numel() for p in self.gist_hypernet.parameters()) if self.gist_hypernet is not None else 0
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + gist_hypernet
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -444,6 +571,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'gist_hypernet': gist_hypernet,
             'total': total,
         }
 
@@ -459,7 +587,16 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        # Gist hypernetwork: projection matrices join the Muon matrix params; the per-slot
+        # queries (embedding-like) and alpha gates (scalars) get their own AdamW groups.
+        gist_hn_query_params = []
+        gist_hn_gate_params = []
+        if self.gist_hypernet is not None:
+            matrix_params += [self.gist_hypernet.c_k.weight, self.gist_hypernet.c_v.weight, self.gist_hypernet.c_proj.weight]
+            gist_hn_query_params = [self.gist_hypernet.queries]
+            if self.gist_hypernet.alphas is not None:
+                gist_hn_gate_params = [self.gist_hypernet.alphas]
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(gist_hn_query_params) + len(gist_hn_gate_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -475,6 +612,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if gist_hn_query_params:  # like value_embeds
+            param_groups.append(dict(kind='adamw', params=gist_hn_query_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01))
+        if gist_hn_gate_params:  # like the smear/backout gate scalars
+            param_groups.append(dict(kind='adamw', params=gist_hn_gate_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -503,6 +644,11 @@ class GPT(nn.Module):
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
+        # Gist hypernetwork: override gist-position embeddings with sentence-content-conditioned
+        # ones. Full-sequence forward only, mirroring the sentence-mask condition below (on the
+        # kv-cache path gist positions keep their fixed rows).
+        if kv_cache is None and self.gist_hypernet is not None:
+            x = self._apply_gist_hypernet(x, idx, cos_sin)
         x = norm(x)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)

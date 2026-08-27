@@ -86,6 +86,65 @@ def sentence_attention_experiments() -> list[dict]:
     return configs
 
 
+def gist_hypernetwork_experiments() -> list[dict]:
+    """Gist hypernetwork: 2 arms against the existing fixed-gist control (d12_sa_nltk_k8).
+
+    Tests whether CONTENT-conditioned gist input embeddings beat the fixed learned gist rows
+    in the strict block-causal regime, where the gist channel is the only cross-sentence path
+    (ADR 0001). The hypernetwork is one masked cross-attention pass: K=8 per-slot learned
+    queries attend over the completed sentence's wte embeddings (nanochat.gpt.GistHypernet).
+
+    Two arms so a null is interpretable (ADR 0002):
+      - gated:  gist embedding = fixed row + alpha_k * h(sentence), per-slot alpha zero-init
+                (bit-exact equal to the control at init; alpha readout diagnoses "gate shut")
+      - forced: gist embedding = h(sentence) outright (no fallback; the model MUST use content)
+
+    Training protocol matches sentence_attention_experiments exactly (d12 / 10k steps /
+    single seed / --window-pattern L / no in-training evaluation) so the only difference vs
+    the d12_sa_nltk_k8 control is the --gist-hypernet flag. Decision rule and win margin:
+    experiments/gist-hypernetwork.md.
+    """
+    experiment_slug = "gist-hypernetwork"
+    num_gpus = 4
+    instance_type = "a100.4gpu"
+    depth = 12
+    seed = 0
+
+    shared_args = [
+        f"--depth {depth}",
+        "--window-pattern L",
+        "--num-iterations 10000",
+        # Reviewer-mandated (inherited from the sentence-attention group): no in-training eval.
+        "--eval-every -1",
+        "--core-metric-every -1",
+        "--sample-every -1",
+        "--gist-placement sentence_nltk",
+        "--num-gist-tokens 8",
+    ]
+
+    arms = [
+        ("hnet_gated", "d12 sentence-attn NLTK K=8 + gist hypernet GATED (fixed row + alpha*h, alpha=0 init), 10k steps", ["--gist-hypernet gated"]),
+        ("hnet_forced", "d12 sentence-attn NLTK K=8 + gist hypernet FORCED (pure h(sentence), no fallback), 10k steps", ["--gist-hypernet forced"]),
+    ]
+
+    configs = []
+    for tag, description, extra_args in arms:
+        args_parts = shared_args + extra_args + [f"--seed {seed}"]
+        args_str = " ".join(args_parts).strip()
+        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+        model_tag = f"d{depth}_sa_nltk_k8_{tag}"
+        configs.append({
+            "args": args_str,
+            "model_tag": model_tag,
+            "description": description,
+            "cmd_hash": cmd_hash,
+            "instance_type": instance_type,
+            "experiment_slug": experiment_slug,
+            "num_gpus": num_gpus,
+        })
+    return configs
+
+
 # ---------------------------------------------------------------------------
 # CLI and job submission
 # ---------------------------------------------------------------------------
@@ -152,6 +211,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     experiment_configs = [
         *sentence_attention_experiments(),
+        *gist_hypernetwork_experiments(),
     ]
 
     for experiment_config in experiment_configs:
