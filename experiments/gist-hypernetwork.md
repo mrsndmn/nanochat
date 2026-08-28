@@ -111,3 +111,10 @@ barely load-bearing there, a redundant-content mechanism has even less room.
   KV stream (`gist_hypernetwork_engram_experiments`, `--gist-engram-bits/-dim`,
   `_bigram_engram_lookup` kept eager via compiler.disable per the Inductor int32 lesson).
   Two capacity arms (2^18, 2^20 × 128), bit-exact vs the gated arm at init.
+- 2026-08-28: Extended the engram sweep to 4 capacity arms (2^17..2^20 × 128) and submitted
+  all training jobs from commit `032ed79`:
+  - `d12_sa_nltk_k8_hnet_gated_eng_b17` → `lm-mpi-job-1abca184-9ef1-4231-8fa0-3b05bb55bcec`
+  - `d12_sa_nltk_k8_hnet_gated_eng_b18` → `lm-mpi-job-86c694a4-07f0-497d-b955-5157affa5884`
+  - `d12_sa_nltk_k8_hnet_gated_eng_b19` → `lm-mpi-job-d07cc51a-3cb3-4125-a1cc-b0711e8512ef`
+  - `d12_sa_nltk_k8_hnet_gated_eng_b20` → `lm-mpi-job-00301972-7ac5-400d-9415-6d304f116f1b`
+  Evaluation (bpb+core) chained automatically after training completion.
