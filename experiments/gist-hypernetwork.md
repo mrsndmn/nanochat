@@ -22,6 +22,21 @@ across slots means the content channel went unused (honest null); forced-arm-wor
 gated-at-control means the channel is useless/harmful and falsifies the direction, including
 the deferred test-time-training follow-up.
 
+### Iteration 2 — Engram sparse bigram memory
+
+Iteration 1 established that *context-derived* content is redundant (the trunk computes it
+anyway) while the channel itself is used at full strength (open α gates). Iteration 2 tests
+the axis the null left open: **stored parametric memory the trunk cannot compute from
+context**. A zero-init hashed bigram table (engram-lite recipe, dev/LOG 2026-01-27; token-
+level variant was this repo's best low-dim-projection result) feeds retrieved n-gram
+associations into the hypernet's key/value inputs; the K slot queries select over them, and
+the own-sentence mask keeps retrieval sentence-local. Two arms sweep table capacity
+(2^18 vs 2^20 rows × 128). Zero-init ⇒ bit-exact equal to the gated arm at init;
+dead-path-safe because the projection is nonzero and α is known to open. Win gate unchanged
+(val BPB ≤ 0.8161); post-hoc readouts: α gates + table row-norm stats (used capacity).
+Param-fairness caveat: the table adds ~33M/~134M embedding-like params — inherent to the
+Engram thesis (sparse memory is cheap capacity), reported, not matched.
+
 ## Setup
 
 - **Training function (source of truth):** `gist_hypernetwork_experiments` in
@@ -92,3 +107,7 @@ barely load-bearing there, a redundant-content mechanism has even less room.
   `lm-mpi-job-b5f7bb10-22b9-428c-a353-a446e09db555` forced). Results + conclusions
   recorded: NULL vs the −0.003 win gate; alpha gates open (mean |α|=1.15) ⇒ content
   channel used-but-redundant; input-level TTT follow-up deprioritized.
+- 2026-08-28: Iteration 2 implemented — Engram-style sparse bigram memory in the hypernet
+  KV stream (`gist_hypernetwork_engram_experiments`, `--gist-engram-bits/-dim`,
+  `_bigram_engram_lookup` kept eager via compiler.disable per the Inductor int32 lesson).
+  Two capacity arms (2^18, 2^20 × 128), bit-exact vs the gated arm at init.

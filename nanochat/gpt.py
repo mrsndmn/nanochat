@@ -53,6 +53,12 @@ class GPTConfig:
     #               (bit-exact equal to "none" at init)
     #   "forced" -> gist embedding = h(sentence) outright (no fixed-row fallback, no gate)
     gist_hypernet: str = "none"
+    # Engram-style sparse bigram memory for the gist hypernetwork (requires gist_hypernet).
+    # bits > 0 enables a zero-init hashed bigram table with 2**bits rows x gist_engram_dim;
+    # retrieved memories are projected and added to the hypernet's key/value inputs, so the
+    # slot queries select over stored n-gram associations the trunk cannot compute from context.
+    gist_engram_bits: int = 0
+    gist_engram_dim: int = 128
 
 
 def norm(x):
@@ -123,6 +129,19 @@ def _gist_cross_attn_mask(idx, gist_start, bos_token_id):
     return allowed.unsqueeze(1)                                     # (B, 1, T, T) bool
 
 
+@torch.compiler.disable
+def _bigram_engram_lookup(table, idx):
+    """Engram-lite bigram memory lookup: hash (36313*cur XOR 27191*prev) mod rows (the
+    dev/LOG-proven recipe), gather from the zero-init table. Position 0 has no bigram and
+    gets zeros. Kept eager via compiler.disable: an int product chain feeding a gather
+    index is the known Inductor int32-overflow trap in this project."""
+    B, T = idx.shape
+    cur, prev = idx[:, 1:], idx[:, :-1]
+    h = ((36313 * cur) ^ (27191 * prev)) % table.num_embeddings
+    e = table(h)  # (B, T-1, D)
+    return torch.cat([e.new_zeros(B, 1, e.size(-1)), e], dim=1)
+
+
 class GistHypernet(nn.Module):
     """Content-conditioned gist embeddings ("gated"/"forced" arms of the gist-hypernetwork
     experiment).
@@ -154,6 +173,14 @@ class GistHypernet(nn.Module):
         self.c_v = Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_proj = Linear(config.n_embd, config.n_embd, bias=False)
         self.alphas = nn.Parameter(torch.zeros(self.num_slots)) if self.mode == "gated" else None
+        # Engram memory: zero-init hashed bigram table + nonzero-init projection into the
+        # KV input. Table zero-init makes the arm bit-exact equal to the engram-free arm at
+        # init; the NONZERO projection keeps the pair off the dead zero-times-zero path.
+        self.engram_table = None
+        self.engram_proj = None
+        if config.gist_engram_bits > 0:
+            self.engram_table = nn.Embedding(2 ** config.gist_engram_bits, config.gist_engram_dim)
+            self.engram_proj = Linear(config.gist_engram_dim, config.n_embd, bias=False)
 
 
 class CausalSelfAttention(nn.Module):
@@ -267,6 +294,8 @@ class GPT(nn.Module):
         assert config.gist_hypernet in ("none", "gated", "forced"), f"invalid gist_hypernet: {config.gist_hypernet}"
         if config.gist_hypernet != "none":
             assert config.end_of_sentence_token_ids, "gist_hypernet requires gist tokens (end_of_sentence_token_ids)"
+        if config.gist_engram_bits > 0:
+            assert config.gist_hypernet != "none", "gist_engram_bits requires gist_hypernet"
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -378,6 +407,12 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(self.gist_hypernet.c_proj.weight, -s, s)
             if self.gist_hypernet.alphas is not None:
                 torch.nn.init.zeros_(self.gist_hypernet.alphas)
+            if self.gist_hypernet.engram_table is not None:
+                # Zero-init table (engram-lite recipe): the arm starts identical to the
+                # engram-free one; the projection is nonzero so the table stays trainable.
+                torch.nn.init.zeros_(self.gist_hypernet.engram_table.weight)
+                s_e = 3**0.5 * self.config.gist_engram_dim**-0.5
+                torch.nn.init.uniform_(self.gist_hypernet.engram_proj.weight, -s_e, s_e)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -391,6 +426,8 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+            if self.gist_hypernet is not None and self.gist_hypernet.engram_table is not None:
+                self.gist_hypernet.engram_table.to(dtype=COMPUTE_DTYPE)  # large table, embedding-like
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -487,6 +524,11 @@ class GPT(nn.Module):
         slot = (idx - hn.gist_start).clamp(min=0)
         q = hn.queries.to(x.dtype)[slot].view(B, T, hn.n_head, hn.head_dim)
         xn = norm(x)
+        # Engram memory: add projected hashed-bigram retrievals to the KV input, so slot
+        # queries select over stored n-gram associations (zero contribution at init).
+        if hn.engram_table is not None:
+            e = _bigram_engram_lookup(hn.engram_table, idx)
+            xn = xn + hn.engram_proj(e.to(x.dtype))
         k = hn.c_k(xn).view(B, T, hn.n_head, hn.head_dim)
         v = hn.c_v(xn).view(B, T, hn.n_head, hn.head_dim)
         # Same rotary + QK-norm + sharpening treatment as the trunk attention, so key/query
@@ -525,10 +567,12 @@ class GPT(nn.Module):
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
         if self.gist_hypernet is not None:
-            # queries/alphas are lookups/scalars, not matmuls
+            # queries/alphas/engram table are lookups/scalars, not matmuls
             nparams_exclude += self.gist_hypernet.queries.numel()
             if self.gist_hypernet.alphas is not None:
                 nparams_exclude += self.gist_hypernet.alphas.numel()
+            if self.gist_hypernet.engram_table is not None:
+                nparams_exclude += self.gist_hypernet.engram_table.weight.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -588,12 +632,16 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
         # Gist hypernetwork: projection matrices join the Muon matrix params; the per-slot
-        # queries (embedding-like) and alpha gates (scalars) get their own AdamW groups.
+        # queries and the engram table (both embedding-like) and alpha gates (scalars) get
+        # their own AdamW groups.
         gist_hn_query_params = []
         gist_hn_gate_params = []
         if self.gist_hypernet is not None:
             matrix_params += [self.gist_hypernet.c_k.weight, self.gist_hypernet.c_v.weight, self.gist_hypernet.c_proj.weight]
             gist_hn_query_params = [self.gist_hypernet.queries]
+            if self.gist_hypernet.engram_table is not None:
+                matrix_params += [self.gist_hypernet.engram_proj.weight]
+                gist_hn_query_params += [self.gist_hypernet.engram_table.weight]
             if self.gist_hypernet.alphas is not None:
                 gist_hn_gate_params = [self.gist_hypernet.alphas]
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(gist_hn_query_params) + len(gist_hn_gate_params)

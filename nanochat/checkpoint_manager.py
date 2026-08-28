@@ -32,6 +32,8 @@ def _patch_missing_config_keys(model_config_kwargs):
     model_config_kwargs.setdefault("full_attention_layers", ())
     model_config_kwargs.setdefault("bos_token_id", -1)
     model_config_kwargs.setdefault("gist_hypernet", "none")
+    model_config_kwargs.setdefault("gist_engram_bits", 0)
+    model_config_kwargs.setdefault("gist_engram_dim", 128)
     # JSON round-trips tuples to lists; coerce back so the config holds tuples as declared.
     for _k in ("end_of_sentence_token_ids", "full_attention_layers"):
         if model_config_kwargs.get(_k) is not None:

@@ -57,6 +57,8 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--gist-placement", type=str, default="none", choices=["none", "sentence_nltk", "uniform"], help="gist/end-of-sentence token insertion strategy (none=disabled; uniform reserved for follow-ups)")
 parser.add_argument("--num-gist-tokens", type=int, default=0, help="K gist tokens inserted per sentence boundary (0=disabled). Enables block-causal + global-gist sentence attention")
 parser.add_argument("--gist-hypernet", type=str, default="none", choices=["none", "gated", "forced"], help="content-conditioned gist embeddings: gated=fixed row + alpha*h(sentence) (alpha zero-init), forced=h(sentence) outright. Requires gist tokens")
+parser.add_argument("--gist-engram-bits", type=int, default=0, help="Engram sparse memory for the gist hypernet: zero-init hashed bigram table with 2**bits rows (0=disabled). Requires --gist-hypernet")
+parser.add_argument("--gist-engram-dim", type=int, default=128, help="row dim of the gist-hypernet engram table (projected to model dim)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -157,6 +159,9 @@ else:
 if args.gist_hypernet != "none":
     assert gist_token_ids_tuple, "--gist-hypernet requires --gist-placement and --num-gist-tokens > 0"
     print0(f"Gist hypernetwork: mode={args.gist_hypernet}")
+if args.gist_engram_bits > 0:
+    assert args.gist_hypernet != "none", "--gist-engram-bits requires --gist-hypernet"
+    print0(f"Gist engram memory: 2**{args.gist_engram_bits} rows x {args.gist_engram_dim}")
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -177,6 +182,8 @@ def build_model_meta(depth):
         full_attention_layers=(),
         bos_token_id=(tokenizer.get_bos_token_id() if gist_token_ids_tuple else -1),
         gist_hypernet=args.gist_hypernet,
+        gist_engram_bits=args.gist_engram_bits,
+        gist_engram_dim=args.gist_engram_dim,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

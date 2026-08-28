@@ -29,6 +29,12 @@ One of the K gist positions emitted at a single sentence boundary; slots are
 distinguishable (each can carry a different facet of the sentence summary).
 _Avoid_: gist copy, gist repeat
 
+**Engram Gist Memory**:
+A hashed bigram lookup table whose retrieved entries feed the Gist Hypernetwork's
+key/value stream — stored n-gram associations, as opposed to content recomputed
+from the context window.
+_Avoid_: bigram hash embeddings (that names the token-level residual-stream variant), conditional memory
+
 **Gist Hypernetwork**:
 A learned encoder that maps a completed sentence's tokens to the gist
 embedding(s) emitted at that sentence's boundary, replacing the fixed learned

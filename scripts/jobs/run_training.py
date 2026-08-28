@@ -145,6 +145,66 @@ def gist_hypernetwork_experiments() -> list[dict]:
     return configs
 
 
+def gist_hypernetwork_engram_experiments() -> list[dict]:
+    """Gist hypernetwork iteration 2: Engram-style sparse bigram memory in the KV stream.
+
+    Iteration 1 found the content channel USED (final |alpha| ~ 1.15) but REDUNDANT — the
+    trunk already computes sentence content into gist positions, so re-encoding context
+    bought ~nothing (gated 0.81826 vs control 0.81906). This iteration injects what the
+    trunk CANNOT compute from context: stored n-gram associations. A zero-init hashed
+    bigram table (engram-lite recipe from dev/LOG 2026-01-27) feeds retrieved memories
+    into the hypernet's key/value inputs; the K slot queries select over them.
+
+    Two arms sweep table capacity (2**18 vs 2**20 rows x 128 dim) on top of the GATED
+    hypernet. Zero-init table => each arm is bit-exact equal to the plain gated arm at
+    init. Protocol identical to iteration 1 (d12 / 10k / single seed / no in-training
+    eval); the table is excluded from the scaling-params horizon computation. Decision
+    rule unchanged: win = val BPB <= 0.8161 (experiments/gist-hypernetwork.md). Post-hoc
+    readouts: alpha gates + engram table row-norm stats (used capacity).
+    """
+    experiment_slug = "gist-hypernetwork"
+    num_gpus = 4
+    instance_type = "a100.4gpu"
+    depth = 12
+    seed = 0
+
+    shared_args = [
+        f"--depth {depth}",
+        "--window-pattern L",
+        "--num-iterations 10000",
+        # Reviewer-mandated (inherited): no in-training evaluation.
+        "--eval-every -1",
+        "--core-metric-every -1",
+        "--sample-every -1",
+        "--gist-placement sentence_nltk",
+        "--num-gist-tokens 8",
+        "--gist-hypernet gated",
+        "--gist-engram-dim 128",
+    ]
+
+    arms = [
+        ("hnet_gated_eng_b18", "d12 sentence-attn K=8 gated hypernet + engram bigram table 2^18x128, 10k steps", ["--gist-engram-bits 18"]),
+        ("hnet_gated_eng_b20", "d12 sentence-attn K=8 gated hypernet + engram bigram table 2^20x128, 10k steps", ["--gist-engram-bits 20"]),
+    ]
+
+    configs = []
+    for tag, description, extra_args in arms:
+        args_parts = shared_args + extra_args + [f"--seed {seed}"]
+        args_str = " ".join(args_parts).strip()
+        cmd_hash = hashlib.sha1(args_str.encode("utf-8")).hexdigest()[:8]
+        model_tag = f"d{depth}_sa_nltk_k8_{tag}"
+        configs.append({
+            "args": args_str,
+            "model_tag": model_tag,
+            "description": description,
+            "cmd_hash": cmd_hash,
+            "instance_type": instance_type,
+            "experiment_slug": experiment_slug,
+            "num_gpus": num_gpus,
+        })
+    return configs
+
+
 # ---------------------------------------------------------------------------
 # CLI and job submission
 # ---------------------------------------------------------------------------
@@ -212,6 +272,7 @@ if __name__ == "__main__":
     experiment_configs = [
         *sentence_attention_experiments(),
         *gist_hypernetwork_experiments(),
+        *gist_hypernetwork_engram_experiments(),
     ]
 
     for experiment_config in experiment_configs:

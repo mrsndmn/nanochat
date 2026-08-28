@@ -23,8 +23,12 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.jobs.run_training import gist_hypernetwork_experiments, sentence_attention_experiments
-from nanochat.gpt import GPT, GPTConfig, _gist_cross_attn_mask
+from scripts.jobs.run_training import (
+    gist_hypernetwork_experiments,
+    gist_hypernetwork_engram_experiments,
+    sentence_attention_experiments,
+)
+from nanochat.gpt import GPT, GPTConfig, _gist_cross_attn_mask, _bigram_engram_lookup
 from nanochat.checkpoint_manager import _patch_missing_config_keys
 
 
@@ -160,16 +164,16 @@ GIST_IDS = (62, 63) # K=2, contiguous at the top of the vocab
 BOS = 1
 
 
-def tiny_config(gist_hypernet="none"):
+def tiny_config(gist_hypernet="none", engram_bits=0):
     return GPTConfig(
         sequence_len=32, vocab_size=VOCAB, n_layer=2, n_head=2, n_kv_head=2, n_embd=64,
         window_pattern="L", end_of_sentence_token_ids=GIST_IDS, bos_token_id=BOS,
-        gist_hypernet=gist_hypernet,
+        gist_hypernet=gist_hypernet, gist_engram_bits=engram_bits, gist_engram_dim=16,
     )
 
 
-def build_tiny(gist_hypernet="none", seed=0):
-    model = GPT(tiny_config(gist_hypernet))
+def build_tiny(gist_hypernet="none", seed=0, engram_bits=0):
+    model = GPT(tiny_config(gist_hypernet, engram_bits))
     # Re-seed AFTER construction: module constructors consume RNG (extra hypernet Linears
     # would desync the shared-weight init). Real training constructs on meta device, where
     # construction consumes no RNG, and the hypernet init draws come last in init_weights.
@@ -292,3 +296,111 @@ class TestGistHypernetMechanism:
         kwargs = {}
         _patch_missing_config_keys(kwargs)
         assert kwargs["gist_hypernet"] == "none"
+        assert kwargs["gist_engram_bits"] == 0
+        assert kwargs["gist_engram_dim"] == 128
+
+
+# ---------------------------------------------------------------------------
+# 4) Engram sparse bigram memory (iteration 2)
+# ---------------------------------------------------------------------------
+class TestGistEngramConfigs:
+
+    def test_arms_and_flags(self):
+        configs = gist_hypernetwork_engram_experiments()
+        tags = [c["model_tag"] for c in configs]
+        assert tags == ["d12_sa_nltk_k8_hnet_gated_eng_b18", "d12_sa_nltk_k8_hnet_gated_eng_b20"]
+        by_tag = {c["model_tag"]: c for c in configs}
+        assert "--gist-engram-bits 18" in by_tag["d12_sa_nltk_k8_hnet_gated_eng_b18"]["args"]
+        assert "--gist-engram-bits 20" in by_tag["d12_sa_nltk_k8_hnet_gated_eng_b20"]["args"]
+        for c in configs:
+            assert "--gist-hypernet gated" in c["args"]
+            assert "--gist-engram-dim 128" in c["args"]
+
+    def test_protocol_matches_gated_arm(self):
+        """Only the engram flags may differ vs the iteration-1 gated arm."""
+        gated = next(c for c in gist_hypernetwork_experiments() if c["model_tag"] == "d12_sa_nltk_k8_hnet_gated")
+        gated_flags = set(gated["args"].split())
+        for c in gist_hypernetwork_engram_experiments():
+            extra = set(c["args"].split()) - gated_flags
+            missing = gated_flags - set(c["args"].split())
+            assert missing == set(), f"{c['model_tag']} dropped gated-arm flags: {missing}"
+            assert extra <= {"--gist-engram-bits", "18", "20", "--gist-engram-dim", "128"}, extra
+
+
+class TestGistEngramMechanism:
+
+    def test_bigram_lookup_shape_and_position0(self):
+        table = torch.nn.Embedding(2 ** 8, 16)
+        idx = torch.randint(0, VOCAB, (2, 12))
+        e = _bigram_engram_lookup(table, idx)
+        assert e.shape == (2, 12, 16)
+        assert torch.equal(e[:, 0], torch.zeros(2, 16))  # no bigram at position 0
+
+    def test_bigram_lookup_locality(self):
+        """Changing token j changes only the retrievals at positions j and j+1 (its two
+        bigrams), nothing else."""
+        torch.manual_seed(0)
+        table = torch.nn.Embedding(2 ** 8, 16)
+        idx = torch.randint(0, VOCAB, (1, 12))
+        e = _bigram_engram_lookup(table, idx)
+        idx2 = idx.clone(); idx2[0, 5] = (idx2[0, 5] + 1) % VOCAB
+        e2 = _bigram_engram_lookup(table, idx2)
+        changed = [t for t in range(12) if not torch.equal(e[0, t], e2[0, t])]
+        assert set(changed) <= {5, 6}
+
+    def test_engram_bit_exact_vs_gated_at_init(self):
+        """Zero-init table => the engram arm starts bit-for-bit identical to the plain
+        gated arm (engram init draws come last, so shared weights match under one seed)."""
+        gated = build_tiny("gated")
+        engram = build_tiny("gated", engram_bits=8)
+        with torch.no_grad():
+            assert torch.equal(gated.forward(IDX), engram.forward(IDX))
+
+    def test_engram_table_trainable_once_gates_open(self):
+        """Dead-path guard: with alpha forced open, touched table rows must receive
+        nonzero gradient through the nonzero-init projection."""
+        model = build_tiny("gated", engram_bits=8).train()
+        with torch.no_grad():
+            model.gist_hypernet.alphas.fill_(1.0)
+        targets = torch.roll(IDX, -1, dims=1)
+        loss = model.forward(IDX, targets=targets)
+        loss.backward()
+        g = model.gist_hypernet.engram_table.weight.grad
+        assert g is not None
+        assert g.abs().sum().item() > 0
+
+    def test_engram_changes_forward_once_table_nonzero(self):
+        model = build_tiny("gated", engram_bits=8)
+        with torch.no_grad():
+            model.gist_hypernet.alphas.fill_(1.0)
+            base = model.forward(IDX)
+            model.gist_hypernet.engram_table.weight.normal_(0, 0.5)
+            assert not torch.equal(model.forward(IDX), base)
+
+    def test_optimizer_partition_with_engram(self):
+        model = build_tiny("gated", engram_bits=8)
+        optimizer = model.setup_optimizer()  # internal partition assert
+        kinds = {id(p): g["kind"] for g in optimizer.param_groups for p in g["params"]}
+        hn = model.gist_hypernet
+        assert kinds[id(hn.engram_table.weight)] == "adamw"
+        assert kinds[id(hn.engram_proj.weight)] == "muon"
+
+    def test_scaling_params_exclude_table_from_horizon_groups(self):
+        model = build_tiny("gated", engram_bits=8)
+        counts = model.num_scaling_params()
+        control = build_tiny("none")
+        control_counts = control.num_scaling_params()
+        assert counts["transformer_matrices"] == control_counts["transformer_matrices"]
+        assert counts["lm_head"] == control_counts["lm_head"]
+        assert counts["gist_hypernet"] > (2 ** 8) * 16  # includes the table
+
+    def test_engram_requires_hypernet(self):
+        cfg = GPTConfig(sequence_len=32, vocab_size=VOCAB, n_layer=2, n_head=2, n_kv_head=2,
+                        n_embd=64, end_of_sentence_token_ids=GIST_IDS, bos_token_id=BOS,
+                        gist_engram_bits=8)  # hypernet off
+        with pytest.raises(AssertionError):
+            GPT(cfg)
+
+    def test_meta_device_construction_with_engram(self):
+        with torch.device("meta"):
+            GPT(tiny_config("gated", engram_bits=8))
