@@ -69,6 +69,25 @@ End-of-training (step 10000) evaluation, val BPB (primary) and CORE (reference-o
 - **Forced ≈ control** (−0.0004): pure content-conditioned embeddings with no fixed-row
   fallback lose nothing — the content channel is fully *sufficient*, not harmful.
 
+### Iteration 2 results (engram sweep, end-of-training step 10000)
+
+| Arm | val BPB | Δ vs gated (0.81826) | CORE | mean α | table rows touched / mean norm |
+|-----|---------|----------------------|------|--------|--------------------------------|
+| `eng_b17` (2^17×128) | 0.81919 | +0.0009 | 0.1377 ± 0.0012 | 0.424 | 100% / 16.3 |
+| `eng_b18` (2^18×128) | 0.81948 | +0.0012 | 0.1163 ± 0.0014 | 0.509 | 100% / 17.0 |
+| `eng_b19` (2^19×128) | 0.81968 | +0.0014 | 0.1263 ± 0.0020 | 0.526 | 100% / 18.5 |
+| `eng_b20` (2^20×128) | 0.81879 | +0.0005 | 0.1435 ± 0.0016 | 0.581 | 100% / 22.0 |
+
+- **Null → mild regression.** Every engram arm is WORSE than the plain gated hypernet
+  (0.81826) and none approaches the win gate (0.8161); no favorable capacity trend
+  (b20 least-bad but still behind gated). Train BPB is worse in step too (e.g. 0.8221 vs
+  0.8211) — interference, not overfitting.
+- **Mechanistic readout — used, harmful, gated down**: the tables were written at full
+  breadth (100% of rows, row norms comparable to wte rows), yet the α gates CLOSED
+  relative to plain gated (1.15 → 0.42–0.58). Mixing hashed-bigram memory into the shared
+  KV stream degraded the channel's signal; the model responded by attenuating the whole
+  hypernet pathway, landing slightly below the engram-free arm.
+
 ## Conclusions
 
 **Null, with a sharp mechanism story: content-conditioned gist input embeddings are USED but
@@ -90,6 +109,18 @@ gist KV states, not input embeddings).
 Next steps considered: (a) close the strict-regime gap via channel capacity (wider gist
 bandwidth / windows) rather than content; (b) port nothing to the alt regime — with gists
 barely load-bearing there, a redundant-content mechanism has even less room.
+
+**Iteration 2 addendum (engram): the gist-input direction is now double-falsified.**
+Neither recomputed context content (it.1: used-but-redundant) nor stored n-gram memory
+(it.2: used-but-harmful) improves the strict regime through the gist input channel. The
+it.2 failure mode is specific and instructive: additive mixing of hashed-bigram retrievals
+into the hypernet's shared KV stream displaced the (already-marginal) content signal —
+collisions inject context-independent noise the slot queries cannot fully filter, and the
+α gates closed to compensate. Any future memory attempt should (a) give memory its own
+pathway (separate value stream / dedicated slots) instead of additive KV mixing, and
+(b) target the trunk residual stream (where token-level engram-lite previously DID help)
+rather than the gist channel. The strict-regime gap to full causal remains attributable to
+channel bandwidth / block-causality, not to what is written into gist inputs.
 
 ## Changelog
 
