@@ -118,3 +118,10 @@ barely load-bearing there, a redundant-content mechanism has even less room.
   - `d12_sa_nltk_k8_hnet_gated_eng_b19` → `lm-mpi-job-d07cc51a-3cb3-4125-a1cc-b0711e8512ef`
   - `d12_sa_nltk_k8_hnet_gated_eng_b20` → `lm-mpi-job-00301972-7ac5-400d-9415-6d304f116f1b`
   Evaluation (bpb+core) chained automatically after training completion.
+- 2026-08-29: All four engram trainings completed; step-10000 checkpoints verified on disk.
+  Chained eval jobs submitted (bpb+core, step 10000):
+  - `eng_b17` eval → `lm-mpi-job-a12913a8-8fce-4779-943f-9116c02734c3`
+  - `eng_b18` eval → `lm-mpi-job-1a583803-f894-4439-bde9-dc824da10458`
+  - `eng_b19` eval → `lm-mpi-job-be2285d7-dc67-400a-b76d-c75dbd5b710a`
+  - `eng_b20` eval → `lm-mpi-job-81749009-5e78-4502-90c4-00f76d6c8a3e`
+  (Eval→arm mapping to be confirmed from job descriptions when results are read.)
