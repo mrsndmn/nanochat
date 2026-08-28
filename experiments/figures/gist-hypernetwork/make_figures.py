@@ -310,7 +310,7 @@ def fig3():
 # FIG 4 — results + mechanism
 # ===========================================================================
 def fig4():
-    W, H = 1960, 730
+    W, H = 1960, 910
     o = [svg_open(W, H)]
     o.append(text(28, 40, "Results — the gist-input channel is double-falsified", 21, INK, "bold"))
     o.append(text(28, 64, "Iteration 1: content is used but redundant. Iteration 2: memory is used but harmful. The win gate was never approached.", 13, INK2))
@@ -423,22 +423,49 @@ def fig4():
     ]
     for i, (lbl, v, c) in enumerate(bars):
         y = 210 + i * 70
-        o.append(text(dx0 - 12, y + 4, lbl, 12, INK2, anchor="end"))
+        o.append(text(dx0, y - 18, lbl, 12, INK2))
         o.append(rect(dx0, y - 9, XT(v) - dx0, 18, c, rx=4))
         o.append(text(XT(v) + 10, y + 4, f"{v:,.0f}", 12, INK, "bold"))
         if lbl.startswith("sentence"):
-            o.append(text(XT(v) + 10, y - 24, "−83.5%", 15, ORANGE, "bold"))
+            o.append(text(XT(v) + 55, y + 4, "−83.5%", 13, ORANGE, "bold"))
     for i, s in enumerate([
-        "83.5% fewer attended keys per query than the full-causal baseline",
-        "(169 vs 1024; −71.4% even against a same-doc causal reference).",
-        "Attention pairs ≈ prefill FLOPs and KV cache — both scale 1:1 with them.",
-        "Cost: inserted gist tokens occupy 25% of sequence capacity (40% at",
-        "K=16, where the saving falls to 72.4%).",
+        "83.5% fewer attended keys per query than the full-causal",
+        "baseline (169 vs 1,025; −71.4% vs a same-doc causal",
+        "reference, 593). Attention pairs ≈ prefill FLOPs and",
+        "KV-cache reads — both scale 1:1 with them. Cost: gist",
+        "tokens fill 25.0% of sequence capacity (40.3% at K=16,",
+        "where the saving falls to 72.4%).",
     ]):
         o.append(text(dx0 - 12, 470 + i * 17, s, 11, INK2))
 
+    # ---- token & attention accounting (measured: compute_token_savings.py) ----
+    sy = 600
+    o.append(line(28, sy, W - 28, sy, GRID, 1))
+    o.append(text(28, sy + 30, "What could the mechanism save? — token & attention accounting, strict K=8, measured on 200 val rows (T=2048; measure_token_savings.py)", 14, INK, "bold"))
+    tiles = [
+        ("+33.3%", "tokens (COST)", ["gist insertion inflates the stream:", "25.0% of positions are gist tokens", "(40.3% at K=16); every FLOP pays this"]),
+        ("−83.5%", "attended keys per query", ["169 vs 1,025 against the full-causal", "baseline; −71.4% vs the same-doc", "causal reference (593 keys)"]),
+        ("−70.6%", "attention entries, NET", ["vs full causal on the raw (un-gisted)", "stream — i.e. after paying the +33.3%", "token inflation"]),
+    ]
+    for i, (big, lbl, lines) in enumerate(tiles):
+        x = 28 + i * 480
+        o.append(rect(x, sy + 46, 450, 110, "#ffffff", rx=8, stroke=GRID, sw=1.5))
+        o.append(text(x + 18, sy + 84, big, 26, INK, "bold"))
+        o.append(text(x + 168, sy + 84, lbl, 12.5, INK2, "bold"))
+        for j, s in enumerate(lines):
+            o.append(text(x + 18, sy + 106 + j * 16, s, 11.5, INK2))
+    o.append(text(1520, sy + 66, "Potential, not realized: the current", 12, INK2, "bold"))
+    for j, s in enumerate([
+        "implementation runs a dense masked SDPA,",
+        "so measured wall clock is 1.5–1.8× SLOWER",
+        "than full causal. Cashing these savings in",
+        "requires a block-sparse / Flex kernel and",
+        "longer contexts than T=2048.",
+    ]):
+        o.append(text(1520, sy + 86 + j * 16, s, 11.5, INK2))
+
     # ---- takeaway strip ----
-    ty = 600
+    ty = 780
     o.append(line(28, ty, W - 28, ty, GRID, 1))
     o.append(text(28, ty + 28, "Takeaway", 14, INK, "bold"))
     for i, s in enumerate([

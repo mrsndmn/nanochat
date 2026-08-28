@@ -164,6 +164,12 @@ sentence boundaries, the same loader path as the BPB eval):
   KV stream (`gist_hypernetwork_engram_experiments`, `--gist-engram-bits/-dim`,
   `_bigram_engram_lookup` kept eager via compiler.disable per the Inductor int32 lesson).
   Two capacity arms (2^18, 2^20 × 128), bit-exact vs the gated arm at init.
+- 2026-08-29: Summary figures extended: fig4 now carries a CORE panel (5-eval-seed
+  whiskers) and the measured token/attention accounting (`measure_token_savings.py`,
+  200 val rows, exact training mask): strict K=8 attends 169 vs 1,025 keys/query
+  (−83.5%; −71.4% vs same-doc causal) at the cost of gists filling 25.0% of the
+  stream (+33.3% tokens; net attention −70.6%); K=16: −72.4% at 40.3% gist share.
+  Savings are potential-only — the dense-mask implementation is wall-clock slower.
 - 2026-08-28: Extended the engram sweep to 4 capacity arms (2^17..2^20 × 128) and submitted
   all training jobs from commit `032ed79`:
   - `d12_sa_nltk_k8_hnet_gated_eng_b17` → `lm-mpi-job-1abca184-9ef1-4231-8fa0-3b05bb55bcec`
