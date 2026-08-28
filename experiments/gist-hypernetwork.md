@@ -88,7 +88,7 @@ End-of-training (step 10000) evaluation, val BPB (primary) and CORE (reference-o
   KV stream degraded the channel's signal; the model responded by attenuating the whole
   hypernet pathway, landing slightly below the engram-free arm.
 
-## Conclusions
+
 
 **Null, with a sharp mechanism story: content-conditioned gist input embeddings are USED but
 REDUNDANT.** The alpha readout rules out the "gate stayed shut" null mode (ADR 0002): the
@@ -122,8 +122,30 @@ pathway (separate value stream / dedicated slots) instead of additive KV mixing,
 rather than the gist channel. The strict-regime gap to full causal remains attributable to
 channel bandwidth / block-causality, not to what is written into gist inputs.
 
+### Efficiency metric — attention tokens saved (measured on val rows)
+
+The strict regime's headline promise is efficiency, so fig4 also carries the measured
+attention-token savings. Measured with
+`experiments/figures/gist-hypernetwork/measure_token_savings.py`: the exact
+`GPT._build_sentence_mask` mask over 200 real val rows x 2048 tokens (K=8 gists at NLTK
+sentence boundaries, the same loader path as the BPB eval):
+
+- **169 vs 1024 attended keys per query** — sentence attention removes **83.5%** of
+  attention pairs vs the full-causal baseline (71.4% vs a same-doc causal reference).
+- Attention pairs scale 1:1 with prefill FLOPs and KV-cache size, so both drop by the
+  same fraction.
+- The cost: inserted gist tokens occupy 25% of sequence capacity (at K=16: 40% gists and
+  the saving falls to 72.4%).
+
+## Conclusions
 ## Changelog
 
+- 2026-08-28: Added the attention token-savings metric to fig4 (panel D) and the
+  Results section: 169 vs 1024 attended keys per query on val rows (K=8) — 83.5% of
+  attention pairs / prefill FLOPs / KV removed vs the full-causal baseline, at the
+  cost of gist tokens filling 25% of sequence capacity. Measured by
+  `experiments/figures/gist-hypernetwork/measure_token_savings.py` (exact
+  `GPT._build_sentence_mask` over 200 val rows).
 - 2026-08-27: Deep-interview spec resolved (strict K=8 host regime, −0.003 BPB win gate,
   gated+forced two-arm design). Implemented `GistHypernet` (masked cross-attention, per-slot
   zero-init alpha gates, nonzero c_proj init per the dead-path lesson) + experiment configs +

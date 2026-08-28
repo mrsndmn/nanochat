@@ -310,57 +310,78 @@ def fig3():
 # FIG 4 — results + mechanism
 # ===========================================================================
 def fig4():
-    W, H = 1240, 700
+    W, H = 1960, 730
     o = [svg_open(W, H)]
     o.append(text(28, 40, "Results — the gist-input channel is double-falsified", 21, INK, "bold"))
     o.append(text(28, 64, "Iteration 1: content is used but redundant. Iteration 2: memory is used but harmful. The win gate was never approached.", 13, INK2))
 
-    # ---- panel A: val BPB dot plot ----
-    ax0, ax1 = 300, 760      # x pixel range
-    v0, v1 = 0.800, 0.8210   # value range
-    def X(v):
-        return ax0 + (v - v0) / (v1 - v0) * (ax1 - ax0)
-
-    o.append(text(ax0, 104, "val BPB at 10k steps (lower is better)", 14, INK, "bold"))
+    # (label, val bpb, core, core std over 5 eval seeds or None, color)
     rows = [
-        ("full-causal baseline", 0.80221, MUTED, "reference"),
-        ("fixed-gist control (K=8)", 0.81906, ORANGE, "control"),
-        ("hypernet gated  (it.1)", 0.81826, BLUE, "best of line"),
-        ("hypernet forced  (it.1)", 0.81863, BLUE, ""),
-        ("+ engram 2¹⁷  (it.2)", 0.81919, AQUA, ""),
-        ("+ engram 2¹⁸  (it.2)", 0.81948, AQUA, ""),
-        ("+ engram 2¹⁹  (it.2)", 0.81968, AQUA, "worst"),
-        ("+ engram 2²⁰  (it.2)", 0.81879, AQUA, ""),
+        ("full-causal baseline", 0.80221, 0.18304, None, MUTED),
+        ("fixed-gist control (K=8)", 0.81906, 0.14352, None, ORANGE),
+        ("hypernet gated  (it.1)", 0.81826, 0.14644, 0.0018, BLUE),
+        ("hypernet forced  (it.1)", 0.81863, 0.14880, 0.0020, BLUE),
+        ("+ engram 2¹⁷  (it.2)", 0.81919, 0.13770, 0.0012, AQUA),
+        ("+ engram 2¹⁸  (it.2)", 0.81948, 0.11632, 0.0014, AQUA),
+        ("+ engram 2¹⁹  (it.2)", 0.81968, 0.12631, 0.0020, AQUA),
+        ("+ engram 2²⁰  (it.2)", 0.81879, 0.14352, 0.0016, AQUA),
     ]
     py0, rh = 130, 40
-    # gridlines + axis
+    pyb = py0 + len(rows) * rh  # plot bottom
+
+    # ---- panel A: val BPB dot plot (primary metric) ----
+    ax0, ax1 = 300, 680
+    v0, v1 = 0.800, 0.8210
+    def X(v):
+        return ax0 + (v - v0) / (v1 - v0) * (ax1 - ax0)
+    o.append(text(ax0, 104, "val BPB (primary, lower is better)", 14, INK, "bold"))
     for gv in [0.800, 0.805, 0.810, 0.815, 0.820]:
-        o.append(line(X(gv), py0 - 8, X(gv), py0 + len(rows) * rh + 4, GRID, 1))
-        o.append(text(X(gv), py0 + len(rows) * rh + 22, f"{gv:.3f}", 11, MUTED, anchor="middle"))
-    # win gate line
-    o.append(line(X(0.8161), py0 - 8, X(0.8161), py0 + len(rows) * rh + 4, INK2, 1.4, dash="5,4"))
+        o.append(line(X(gv), py0 - 8, X(gv), pyb + 4, GRID, 1))
+        o.append(text(X(gv), pyb + 22, f"{gv:.3f}", 11, MUTED, anchor="middle"))
+    o.append(line(X(0.8161), py0 - 8, X(0.8161), pyb + 4, INK2, 1.4, dash="5,4"))
     o.append(text(X(0.8161), py0 - 16, "win gate 0.8161", 11.5, INK2, "bold", "middle"))
-    for i, (lbl, v, c, note) in enumerate(rows):
+    for i, (lbl, v, _, _, c) in enumerate(rows):
         y = py0 + i * rh + rh // 2
         o.append(text(ax0 - 12, y + 4, lbl, 12.5, INK, anchor="end"))
         o.append(line(ax0, y, X(v), y, GRID, 1))
         o.append(f'<circle cx="{X(v)}" cy="{y}" r="7" fill="{c}" stroke="{SURFACE}" stroke-width="2"/>')
-        o.append(text(X(v) + 14, y + 4, f"{v:.5f}", 12, INK, "bold"))
-        if note:
-            o.append(text(X(v) + 80, y + 4, note, 11, MUTED))
-    ly = py0 + len(rows) * rh + 48
-    chip(ax0, ly, MUTED, "reference", o)
-    chip(ax0 + 110, ly, ORANGE, "fixed gists", o)
-    chip(ax0 + 230, ly, BLUE, "it.1 content hypernet", o)
-    chip(ax0 + 420, ly, AQUA, "it.2 + engram memory", o)
+        o.append(text(X(v) + 13, y + 4, f"{v:.5f}", 12, INK, "bold"))
 
-    # ---- panel B: alpha gates ----
-    bx0, bw, bgap = 950, 42, 14
-    bY0, bY1 = 130, 400          # plot area
+    # ---- panel B: CORE dot plot (reference-only), same rows ----
+    cx0, cx1 = 800, 1080
+    c0, c1 = 0.10, 0.19
+    def XC(v):
+        return cx0 + (v - c0) / (c1 - c0) * (cx1 - cx0)
+    o.append(text(cx0, 104, "CORE (higher is better; reference-only)", 14, INK, "bold"))
+    for gv in [0.10, 0.12, 0.14, 0.16, 0.18]:
+        o.append(line(XC(gv), py0 - 8, XC(gv), pyb + 4, GRID, 1))
+        o.append(text(XC(gv), pyb + 22, f"{gv:.2f}", 11, MUTED, anchor="middle"))
+    for i, (lbl, _, cv, cs2, c) in enumerate(rows):
+        y = py0 + i * rh + rh // 2
+        o.append(line(cx0, y, XC(cv), y, GRID, 1))
+        if cs2 is not None:  # ± s.d. whisker over the 5 eval seeds
+            o.append(line(XC(cv - cs2), y, XC(cv + cs2), y, INK2, 2))
+        o.append(f'<circle cx="{XC(cv)}" cy="{y}" r="7" fill="{c}" stroke="{SURFACE}" stroke-width="2"/>')
+        if cv > 0.17:
+            o.append(text(XC(cv) - 13, y + 4, f"{cv:.4f}", 12, INK, "bold", "end"))
+        else:
+            o.append(text(XC(cv) + 13, y + 4, f"{cv:.4f}", 12, INK, "bold"))
+    o.append(text(cx0, pyb + 76, "whiskers: ± s.d. over the 5 eval seeds (where evaluated with the", 10.5, MUTED))
+    o.append(text(cx0, pyb + 90, "seeded protocol). Training-seed noise on CORE is ~±0.01.", 10.5, MUTED))
+
+    ly = pyb + 50
+    chip(ax0, ly, MUTED, "reference", o)
+    chip(ax0 + 105, ly, ORANGE, "fixed gists", o)
+    chip(ax0 + 215, ly, BLUE, "it.1 content hypernet", o)
+    chip(ax0 + 390, ly, AQUA, "it.2 + engram memory", o)
+
+    # ---- panel C: alpha gates ----
+    bx0, bw, bgap = 1215, 40, 12
+    bY0, bY1 = 130, 400
     amax = 1.3
     def Y(a):
         return bY1 - a / amax * (bY1 - bY0)
-    o.append(text(bx0 - 40, 104, "gate readout: mean |α| per arm", 14, INK, "bold"))
+    o.append(text(bx0 - 45, 104, "gate readout: mean |α| per arm", 14, INK, "bold"))
     for gv in [0.0, 0.5, 1.0]:
         o.append(line(bx0 - 40, Y(gv), bx0 + 5 * (bw + bgap) - bgap + 8, Y(gv), GRID, 1))
         o.append(text(bx0 - 46, Y(gv) + 4, f"{gv:.1f}", 11, MUTED, anchor="end"))
@@ -369,28 +390,62 @@ def fig4():
     for i, (lbl, a, c) in enumerate(bars):
         x = bx0 + i * (bw + bgap)
         o.append(rect(x, Y(a), bw, bY1 - Y(a), c, rx=4))
-        o.append(rect(x, bY1 - 2, bw, 2, SURFACE))  # crisp baseline anchor
+        o.append(rect(x, bY1 - 2, bw, 2, SURFACE))
         o.append(text(x + bw / 2, Y(a) - 8, f"{a:.2f}", 11.5, INK, "bold", "middle"))
         o.append(text(x + bw / 2, bY1 + 18, lbl, 11.5, INK2, anchor="middle"))
     o.append(line(bx0 - 40, bY1, bx0 + 5 * (bw + bgap) - bgap + 8, bY1, BASELINE, 1.5))
     for i, s in enumerate([
-        "Adding memory to the shared KV stream made",
-        "the model TURN DOWN the whole channel",
-        "(α: 1.15 → 0.42–0.58) — even though every",
-        "table was written at full breadth (100% of",
-        "rows, norms ≈ wte scale). Used, but harmful:",
-        "collision noise displaced the content signal.",
+        "Adding memory to the shared KV stream",
+        "made the model TURN DOWN the whole",
+        "channel (α: 1.15 → 0.42–0.58), despite",
+        "every table being written at full breadth",
+        "(100% of rows, norms ≈ wte scale).",
+        "Used, but harmful: collision noise",
+        "displaced the content signal.",
     ]):
-        o.append(text(bx0 - 40, 452 + i * 18, s, 12, INK2))
+        o.append(text(bx0 - 45, 448 + i * 18, s, 12, INK2))
+
+    # ---- panel D: attention tokens saved (measured on val rows, K=8) ----
+    # Numbers from experiments/figures/gist-hypernetwork/measure_token_savings.py
+    # (200 val rows x 2048 tokens, the exact GPT._build_sentence_mask mask).
+    dx0, dx1 = 1580, 1900
+    vmax = 1100.0
+    def XT(v):
+        return dx0 + v / vmax * (dx1 - dx0)
+    o.append(text(dx0 - 12, 104, "attention tokens per query (K=8, val rows)", 14, INK, "bold"))
+    for gv in [0, 250, 500, 750, 1000]:
+        o.append(line(XT(gv), 130, XT(gv), 420, GRID, 1))
+        o.append(text(XT(gv), 436, f"{gv}", 11, MUTED, anchor="middle"))
+    bars = [
+        ("full causal (baseline)", 1024.5, BASELINE),
+        ("full causal within doc", 593.1, GRID),
+        ("sentence attention (K=8)", 169.4, ORANGE),
+    ]
+    for i, (lbl, v, c) in enumerate(bars):
+        y = 210 + i * 70
+        o.append(text(dx0 - 12, y + 4, lbl, 12, INK2, anchor="end"))
+        o.append(rect(dx0, y - 9, XT(v) - dx0, 18, c, rx=4))
+        o.append(text(XT(v) + 10, y + 4, f"{v:,.0f}", 12, INK, "bold"))
+        if lbl.startswith("sentence"):
+            o.append(text(XT(v) + 10, y - 24, "−83.5%", 15, ORANGE, "bold"))
+    for i, s in enumerate([
+        "83.5% fewer attended keys per query than the full-causal baseline",
+        "(169 vs 1024; −71.4% even against a same-doc causal reference).",
+        "Attention pairs ≈ prefill FLOPs and KV cache — both scale 1:1 with them.",
+        "Cost: inserted gist tokens occupy 25% of sequence capacity (40% at",
+        "K=16, where the saving falls to 72.4%).",
+    ]):
+        o.append(text(dx0 - 12, 470 + i * 17, s, 11, INK2))
 
     # ---- takeaway strip ----
-    ty = 590
+    ty = 600
     o.append(line(28, ty, W - 28, ty, GRID, 1))
     o.append(text(28, ty + 28, "Takeaway", 14, INK, "bold"))
     for i, s in enumerate([
-        "Neither recomputed content (it.1) nor stored n-gram memory (it.2) improves the strict regime through the gist INPUT channel — content was consumed at full gate",
-        "strength yet bought −0.0008 BPB; memory was written at full breadth yet cost +0.0005…+0.0014. The 0.017 gap to full causal lives in channel bandwidth /",
-        "block-causality itself, not in what gist inputs carry. Deferred TTT-on-gist-inputs is deprioritized by the same evidence.",
+        "Neither recomputed content (it.1) nor stored n-gram memory (it.2) improves the strict regime through the gist INPUT channel — content was consumed at full gate strength",
+        "yet bought −0.0008 BPB; memory was written at full breadth yet cost +0.0005…+0.0014. CORE agrees: no arm recovers the strict regime's CORE cost (0.183 → 0.14x) and the",
+        "engram arms trend lower still. The 0.017 BPB gap to full causal lives in channel bandwidth / block-causality itself; deferred TTT-on-gist-inputs is deprioritized by the same evidence.",
+        "Efficiency survives: the strict mask attends 169 vs 1024 keys per query (K=8, val rows) — 83.5% fewer attention tokens / prefill FLOPs — at the cost of gists filling 25% of sequence capacity.",
     ]):
         o.append(text(28, ty + 52 + i * 19, s, 12.5, INK2))
     o.append("</svg>")
