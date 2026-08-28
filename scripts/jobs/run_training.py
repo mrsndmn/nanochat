@@ -155,7 +155,7 @@ def gist_hypernetwork_engram_experiments() -> list[dict]:
     bigram table (engram-lite recipe from dev/LOG 2026-01-27) feeds retrieved memories
     into the hypernet's key/value inputs; the K slot queries select over them.
 
-    Two arms sweep table capacity (2**18 vs 2**20 rows x 128 dim) on top of the GATED
+    Four arms sweep table capacity (2**17..2**20 rows x 128 dim) on top of the GATED
     hypernet. Zero-init table => each arm is bit-exact equal to the plain gated arm at
     init. Protocol identical to iteration 1 (d12 / 10k / single seed / no in-training
     eval); the table is excluded from the scaling-params horizon computation. Decision
@@ -183,7 +183,9 @@ def gist_hypernetwork_engram_experiments() -> list[dict]:
     ]
 
     arms = [
+        ("hnet_gated_eng_b17", "d12 sentence-attn K=8 gated hypernet + engram bigram table 2^17x128, 10k steps", ["--gist-engram-bits 17"]),
         ("hnet_gated_eng_b18", "d12 sentence-attn K=8 gated hypernet + engram bigram table 2^18x128, 10k steps", ["--gist-engram-bits 18"]),
+        ("hnet_gated_eng_b19", "d12 sentence-attn K=8 gated hypernet + engram bigram table 2^19x128, 10k steps", ["--gist-engram-bits 19"]),
         ("hnet_gated_eng_b20", "d12 sentence-attn K=8 gated hypernet + engram bigram table 2^20x128, 10k steps", ["--gist-engram-bits 20"]),
     ]
 

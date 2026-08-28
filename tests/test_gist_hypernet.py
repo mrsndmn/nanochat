@@ -308,10 +308,10 @@ class TestGistEngramConfigs:
     def test_arms_and_flags(self):
         configs = gist_hypernetwork_engram_experiments()
         tags = [c["model_tag"] for c in configs]
-        assert tags == ["d12_sa_nltk_k8_hnet_gated_eng_b18", "d12_sa_nltk_k8_hnet_gated_eng_b20"]
+        assert tags == [f"d12_sa_nltk_k8_hnet_gated_eng_b{b}" for b in (17, 18, 19, 20)]
         by_tag = {c["model_tag"]: c for c in configs}
-        assert "--gist-engram-bits 18" in by_tag["d12_sa_nltk_k8_hnet_gated_eng_b18"]["args"]
-        assert "--gist-engram-bits 20" in by_tag["d12_sa_nltk_k8_hnet_gated_eng_b20"]["args"]
+        for b in (17, 18, 19, 20):
+            assert f"--gist-engram-bits {b}" in by_tag[f"d12_sa_nltk_k8_hnet_gated_eng_b{b}"]["args"]
         for c in configs:
             assert "--gist-hypernet gated" in c["args"]
             assert "--gist-engram-dim 128" in c["args"]
@@ -324,7 +324,7 @@ class TestGistEngramConfigs:
             extra = set(c["args"].split()) - gated_flags
             missing = gated_flags - set(c["args"].split())
             assert missing == set(), f"{c['model_tag']} dropped gated-arm flags: {missing}"
-            assert extra <= {"--gist-engram-bits", "18", "20", "--gist-engram-dim", "128"}, extra
+            assert extra <= {"--gist-engram-bits", "17", "18", "19", "20", "--gist-engram-dim", "128"}, extra
 
 
 class TestGistEngramMechanism:
